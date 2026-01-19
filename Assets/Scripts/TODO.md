@@ -1,0 +1,2 @@
+- [ ] Implement EnsureWorkersGather in EnemyKingController.cs to call TryFindWork for idle enemy workers
+- [ ] Modify VillagerSearchHelper.cs to find closest walkable node if harvest spot node is null or not walkable

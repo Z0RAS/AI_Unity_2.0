@@ -1,0 +1,63 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!78 &1
+TagManager:
+  serializedVersion: 3
+  tags: []
+  layers:
+  - Default
+  - TransparentFX
+  - Ignore Raycast
+  - 
+  - Water
+  - UI
+  - Ground
+  - Building
+  - Resource
+  - Unit
+  - Obstacle
+  - ui
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  - 
+  m_SortingLayers:
+  - name: Default
+    uniqueID: 0
+    locked: 0
+  - name: Ground
+    uniqueID: 855090729
+    locked: 0
+  - name: Building
+    uniqueID: 951050391
+    locked: 0
+  - name: Resource
+    uniqueID: 3276936269
+    locked: 0
+  - name: Unit
+    uniqueID: 2990593393
+    locked: 0
+  - name: Obstacle
+    uniqueID: 3799386087
+    locked: 0
+  - name: UI
+    uniqueID: 1850494711
+    locked: 0
+  m_RenderingLayers:
+  - Default

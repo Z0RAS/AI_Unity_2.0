@@ -1,0 +1,25 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a03d67533e0b69b4b856a8daaae8664d, type: 3}
+  m_Name: Base
+  m_EditorClassIdentifier: Assembly-CSharp::BuildingData
+  buildingName: Base
+  prefab: {fileID: 9081825913150067807, guid: 8fc8fa2a0c8598c46b30b87c11c8657c, type: 3}
+  maxHealth: 3000
+  armor: 2
+  woodCost: 500
+  ironCost: 200
+  goldCost: 0
+  foodCost: 0
+  buildTime: 45
+  populationBonus: 10
+  size: {x: 1, y: 1}
