@@ -6,6 +6,8 @@ using UnityEngine;
 /// Auto-recruit / staggered recruitment logic for BuildingConstruction.
 /// Assigns idle villagers to a construction and reserves unique approach nodes
 /// on the immediate perimeter (outer ring) around the footprint. No fallbacks.
+/// Converted to tick-driven scheduling when TimeController is present to avoid
+/// many WaitForSeconds coroutines and to improve performance.
 /// </summary>
 [DisallowMultipleComponent]
 public class AutoBuildRecruiter : MonoBehaviour
@@ -14,7 +16,7 @@ public class AutoBuildRecruiter : MonoBehaviour
     private bool autoRecruited = false;
 
     [Header("Recruitment")]
-    [Tooltip("Delay (seconds) between recruit commands to spread CPU work")]
+    [Tooltip("Delay (seconds) between recruit commands to spread CPU work (if TimeController present, this is converted to ticks)")]
     public float recruitStagger = 0.06f;
 
     [Tooltip("Enable verbose recruitment diagnostics to the console.")]
@@ -23,14 +25,35 @@ public class AutoBuildRecruiter : MonoBehaviour
     // Hard cap requested by design
     const int GLOBAL_MAX_BUILDERS = 5;
 
+    // tick-scheduled recruitment entries (used when TimeController exists)
+    private struct ScheduledRecruit
+    {
+        public VillagerTaskSystem vill;
+        public int ticksRemaining;
+    }
+    private readonly List<ScheduledRecruit> scheduled = new List<ScheduledRecruit>();
+
     void Awake()
     {
         bc = GetComponent<BuildingConstruction>();
     }
 
+    void OnEnable()
+    {
+        if (TimeController.Instance != null)
+            TimeController.OnTick += OnTick;
+    }
+
+    void OnDisable()
+    {
+        if (TimeController.Instance != null)
+            TimeController.OnTick -= OnTick;
+    }
+
     public void ResetRecruitment()
     {
         autoRecruited = false;
+        scheduled.Clear();
     }
 
     public void AlertNearbyIdleVillagers()
@@ -72,30 +95,94 @@ public class AutoBuildRecruiter : MonoBehaviour
         }
 
         int toRecruit = Mathf.Min(remainingSlots, idleList.Count);
-        int scheduled = 0;
-        for (int i = 0; i < idleList.Count && scheduled < toRecruit; i++)
+        int scheduledCount = 0;
+
+        // If no TimeController available, fall back to coroutine-based staggering for compatibility.
+        if (TimeController.Instance == null)
+        {
+            for (int i = 0; i < idleList.Count && scheduledCount < toRecruit; i++)
+            {
+                var vill = idleList[i];
+                if (vill == null) continue;
+                StartCoroutine(RecruitDelayedCoroutine(vill, scheduledCount * recruitStagger));
+                scheduledCount++;
+            }
+
+            autoRecruited = true;
+            return;
+        }
+
+        // TimeController exists: schedule recruits by ticks (no coroutines).
+        float tickInterval = Mathf.Max(TimeController.Instance.tickInterval, 1e-6f);
+        int staggerTicks = Mathf.Max(1, Mathf.RoundToInt(recruitStagger / tickInterval));
+
+        scheduled.Clear();
+        for (int i = 0; i < idleList.Count && scheduledCount < toRecruit; i++)
         {
             var vill = idleList[i];
             if (vill == null) continue;
-            StartCoroutine(RecruitDelayed(vill, scheduled * recruitStagger));
-            scheduled++;
+            var entry = new ScheduledRecruit
+            {
+                vill = vill,
+                ticksRemaining = staggerTicks * scheduledCount
+            };
+            scheduled.Add(entry);
+            scheduledCount++;
         }
+
 
         autoRecruited = true;
     }
 
-    IEnumerator RecruitDelayed(VillagerTaskSystem vill, float delay)
+    // Coroutine fallback for cases without TimeController
+    IEnumerator RecruitDelayedCoroutine(VillagerTaskSystem vill, float delay)
     {
         if (delay > 0f) yield return new WaitForSeconds(delay);
         if (vill == null) yield break;
         if (!vill.IsIdle()) yield break;
 
+        DoRecruitNow(vill);
+    }
+
+    // Tick handler to process scheduled recruits
+    private void OnTick(float dt)
+    {
+        if (scheduled.Count == 0) return;
+
+        // decrement ticks and collect ready recruits
+        int i = 0;
+        while (i < scheduled.Count)
+        {
+            var e = scheduled[i];
+            e.ticksRemaining = Mathf.Max(0, e.ticksRemaining - 1);
+            if (e.ticksRemaining <= 0)
+            {
+                // pop and execute
+                scheduled.RemoveAt(i);
+                var vill = e.vill;
+                if (vill == null) continue;
+                if (!vill.IsIdle()) continue;
+                DoRecruitNow(vill);
+                // do not increment i since we removed current
+            }
+            else
+            {
+                scheduled[i] = e; // write back updated entry
+                i++;
+            }
+        }
+    }
+
+    // Core recruitment work extracted from original coroutine body
+    private void DoRecruitNow(VillagerTaskSystem vill)
+    {
+        if (vill == null) return;
         var ua = vill.GetComponent<UnitAgent>();
         var nrs = NodeReservationSystem.Instance;
         var gm = GridManager.Instance;
 
         if (nrs == null || gm == null || bc == null || ua == null)
-            yield break;
+            return;
 
         Vector2Int startIdx = gm.GetStartIndicesForCenteredFootprint(bc.transform.position, bc.Size);
         Node centerNode = gm.GetNode(startIdx.x + bc.Size.x / 2, startIdx.y + bc.Size.y / 2);
@@ -103,11 +190,10 @@ public class AutoBuildRecruiter : MonoBehaviour
         if (centerNode == null)
         {
             if (verboseDebug) Debug.LogError($"[AutoBuildRecruiter] Center node is null for building at {bc.transform.position}.");
-            yield break;
+            return;
         }
 
-        if (verboseDebug) Debug.Log($"[AutoBuildRecruiter] Searching for perimeter nodes around building at {bc.transform.position} for {ua.name}.");
-
+         
         // Prefer reserving nodes on the immediate outer perimeter of the footprint,
         // choosing the node closest to the villager.
         Node reservedNode = ReservePerimeterNodeClosestToUnit(nrs, gm, bc, ua, searchRadius: 6);
@@ -118,14 +204,12 @@ public class AutoBuildRecruiter : MonoBehaviour
 
         if (reservedNode == null)
         {
-            if (verboseDebug) Debug.Log($"[AutoBuildRecruiter] Failed to reserve any perimeter node for {ua.name}; skipping.");
-            yield break;
+            return;
         }
 
         try { ua.holdReservation = true; } catch { }
         try { vill.CommandBuild(bc, reservedNode); } catch { }
 
-        if (verboseDebug) Debug.Log($"[AutoBuildRecruiter] Reserved perimeter node {reservedNode.gridX},{reservedNode.gridY} for {ua.name} and assigned to build.");
     }
 
     // Collects perimeter nodes around the footprint up to `searchRadius`, then selects
@@ -173,11 +257,12 @@ public class AutoBuildRecruiter : MonoBehaviour
             // if we collected any candidates on this ring, try them (closest-first)
             if (candidates.Count > 0)
             {
-                // sort by distance to unit
+                // sort by distance to unit (use SimPosition for tick-aware behavior if available)
+                Vector3 uaPos = ua != null ? ua.SimPosition : ua.transform.position;
                 candidates.Sort((a, b) =>
                 {
-                    float da = Vector2.SqrMagnitude(new Vector2(a.centerPosition.x - ua.transform.position.x, a.centerPosition.y - ua.transform.position.y));
-                    float db = Vector2.SqrMagnitude(new Vector2(b.centerPosition.x - ua.transform.position.x, b.centerPosition.y - ua.transform.position.y));
+                    float da = Vector2.SqrMagnitude(new Vector2(a.centerPosition.x - uaPos.x, a.centerPosition.y - uaPos.y));
+                    float db = Vector2.SqrMagnitude(new Vector2(b.centerPosition.x - uaPos.x, b.centerPosition.y - uaPos.y));
                     return da.CompareTo(db);
                 });
 

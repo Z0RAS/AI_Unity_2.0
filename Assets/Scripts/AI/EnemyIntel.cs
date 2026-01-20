@@ -1,6 +1,7 @@
 ﻿using System.Collections.Generic;
 using UnityEngine;
 
+
 /// <summary>
 /// Keeps track of discoveries (resources, leader, player base) and manages
 /// one-time announcements via EnemyDialogueController. Designed to be attached
@@ -19,7 +20,7 @@ public class EnemyIntel : MonoBehaviour
             { ResourceType.Gold, new HashSet<ResourceNode>() }
         };
 
-    private readonly HashSet<ResourceType> announcedResourceTypes = new HashSet<ResourceType>( );
+    private readonly HashSet<ResourceType> announcedResourceTypes = new HashSet<ResourceType>();
     private bool announcedLeader;
     private bool announcedPlayerBase;
     private bool resourceDiscoveryCompleted;
@@ -27,6 +28,24 @@ public class EnemyIntel : MonoBehaviour
     public void Init(EnemyKingController owner)
     {
         Owner = owner;
+    }
+
+    // Helper: speak via EnemyDialogueController but tolerate missing controller (logs fallback)
+    private void SpeakOrLog(string message, Sprite portrait = null, float duration = -1f)
+    {
+        var dlg = EnemyDialogueController.Instance;
+        if (dlg == null)
+            dlg = UnityEngine.Object.FindObjectOfType<EnemyDialogueController>();
+
+        if (dlg != null)
+        {
+            try { dlg.Speak(message, portrait, duration); }
+            catch { Debug.LogWarning("[EnemyIntel] Speak threw."); }
+        }
+        else
+        {
+            Debug.Log($"[EnemyIntel][NoUI] {message}");
+        }
     }
 
     public void RegisterDiscoveredResource(ResourceNode rn)
@@ -50,7 +69,8 @@ public class EnemyIntel : MonoBehaviour
                 string lt = LocalizeResource(rn.resourceType);
                 try
                 {
-                    EnemyDialogueController.Instance?.Speak($"Aptikta: {lt}", null, 3.0f);
+                    SpeakOrLog($"Aptikta: {lt}", null, 3.0f);
+                    Debug.Log($"[EnemyIntel] Discovered resource type: {rn.resourceType} ({lt}) at {rn.transform.position}");
                 }
                 catch { }
             }
@@ -59,7 +79,7 @@ public class EnemyIntel : MonoBehaviour
         if (!resourceDiscoveryCompleted && HaveDiscoveredAllResourceTypes())
         {
             resourceDiscoveryCompleted = true;
-            // Resource discovery completion is handled by setting the flag above
+            Debug.Log("[EnemyIntel] Resource discovery completed for all types.");
         }
     }
 
@@ -71,7 +91,8 @@ public class EnemyIntel : MonoBehaviour
             announcedLeader = true;
             try
             {
-                EnemyDialogueController.Instance?.Speak($"Lyderis aptiktas: {leader.name}", null, 2.6f);
+                SpeakOrLog($"Lyderis aptiktas: {leader.name}", null, 2.6f);
+                Debug.Log($"[EnemyIntel] Leader discovered: {leader.name} at {leader.transform.position}");
             }
             catch { }
         }
@@ -88,7 +109,8 @@ public class EnemyIntel : MonoBehaviour
             try
             {
                 string bname = b.GetComponent<Building>()?.data?.buildingName ?? b.name;
-                EnemyDialogueController.Instance?.Speak($"Bazė aptikta: {bname}", null, 2.6f);
+                SpeakOrLog($"Bazė aptikta: {bname}", null, 2.6f);
+                Debug.Log($"[EnemyIntel] Player base discovered: {bname} at {b.transform.position}");
             }
             catch { }
         }

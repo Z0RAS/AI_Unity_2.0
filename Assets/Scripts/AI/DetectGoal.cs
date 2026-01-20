@@ -38,6 +38,8 @@ public class DetectGoal : IGoal
         var econ = owner.EnemyEconomy;
         if (econ == null) return;
 
+        if (owner.verboseDebug) Debug.Log("[DetectGoal] Tick - scanning from owner's units.");
+
         var myUnits = UnityEngine.Object.FindObjectsOfType<UnitAgent>().Where(u => u != null && u.owner == econ).ToArray();
         foreach (var u in myUnits)
         {
@@ -52,6 +54,7 @@ public class DetectGoal : IGoal
                 var leader = h.GetComponent<LeaderUnit>();
                 if (leader != null && leader.owner != econ && owner.DiscoveredLeader == null)
                 {
+                    Debug.Log($"[DetectGoal] Leader spotted by unit {u.name} at {leader.transform.position}");
                     owner.RegisterDiscoveredLeader(leader.gameObject);
                     EnemyDialogueController.Instance?.Speak($"Leader spotted: {leader.gameObject.name}", null, 2.2f);
                     AttackTarget(leader.gameObject);
@@ -63,6 +66,7 @@ public class DetectGoal : IGoal
                     var bname = (building.data.buildingName ?? "").ToLowerInvariant();
                     if (bname.Contains("base") || bname.Contains("castle") || bname.Contains("town"))
                     {
+                        Debug.Log($"[DetectGoal] Player base spotted by unit {u.name} at {building.transform.position}");
                         owner.RegisterDiscoveredPlayerBase(building.gameObject);
                         EnemyDialogueController.Instance?.Speak($"Base located: {building.data.buildingName}", null, 2.2f);
                         if (owner.DiscoveredLeader != null) AttackTarget(owner.DiscoveredLeader);
@@ -73,7 +77,7 @@ public class DetectGoal : IGoal
                 var rn = h.GetComponent<ResourceNode>();
                 if (rn != null && rn.amount > 0)
                 {
-                    // Register discovery with EnemyIntel (which handles one-time localized announcements).
+                    Debug.Log($"[DetectGoal] Resource node ({rn.resourceType}) seen by unit {u.name} at {rn.transform.position}");
                     owner.RegisterDiscoveredResource(rn);
                 }
 
@@ -94,11 +98,11 @@ public class DetectGoal : IGoal
     private void AttackTarget(GameObject target)
     {
         if (target == null) return;
-        
+
         // Find all enemy military units (units with UnitCombat)
         var allUnits = UnityEngine.Object.FindObjectsOfType<UnitAgent>();
         var militaryUnits = allUnits.Where(u => u != null && u.owner == owner.EnemyEconomy && u.GetComponent<UnitCombat>() != null);
-        
+
         // Command all military units to attack the target
         foreach (var unit in militaryUnits)
         {

@@ -53,6 +53,13 @@ public class NodeReservationSystem : MonoBehaviour
             return false;
         }
 
+        // Prevent reserving nodes that are physically occupied by another unit (or logically claimed).
+        if (IsNodePhysicallyOccupiedByOther(node, unit))
+        {
+            if (debugReservations) Debug.Log($"[NodeReservationSystem] Node ({node.gridX}, {node.gridY}) is physically occupied; cannot reserve for {unit.name}.");
+            return false;
+        }
+
         // Release the unit's previous reservation, if any
         if (reverse.TryGetValue(unit, out var prev) && prev != node)
         {
@@ -97,7 +104,11 @@ public class NodeReservationSystem : MonoBehaviour
             for (int dy = -searchRadius; dy <= searchRadius; dy++)
             {
                 Node n = grid.GetNode(center.gridX + dx, center.gridY + dy);
-                if (n == null || !n.walkable || IsReserved(n)) continue;
+                if (n == null || !n.walkable) continue;
+                if (IsReserved(n)) continue;
+
+                // Skip nodes physically occupied by other units (don't choose nodes where a unit already stands)
+                if (IsNodePhysicallyOccupiedByOther(n, unit)) continue;
 
                 float distanceToAgent = Vector2.Distance(unit.transform.position, n.centerPosition);
                 float distanceToCenter = Vector2.Distance(center.centerPosition, n.centerPosition);
@@ -119,5 +130,88 @@ public class NodeReservationSystem : MonoBehaviour
 
         if (debugReservations) Debug.Log($"[NodeReservationSystem] Failed to reserve a node for {unit.name}.");
         return null;
+    }
+
+    // Helper: determine if a node is currently occupied by any other unit (logical claim / sim-position based)
+    // requester may be null; if provided it's ignored when checking occupancy so units can keep their own reservations.
+    private bool IsNodePhysicallyOccupiedByOther(Node node, UnitAgent requester)
+    {
+        if (node == null) return false;
+
+        var gm = GridManager.Instance;
+        if (gm == null)
+            return false;
+
+        // 1) Check existing reservations / lastAssigned markers
+        foreach (var kv in reservations)
+        {
+            if (kv.Key == node)
+            {
+                var owner = kv.Value;
+                if (owner != null && owner != requester) return true;
+            }
+        }
+
+        // 2) Conservative check: consider units reserved/assigned to this node or whose logical center maps to this node.
+        // Prefer registry iteration (cheap) instead of physics overlap calls.
+        var all = UnitAgent.AllAgents;
+        if (all != null)
+        {
+            for (int i = 0; i < all.Count; i++)
+            {
+                var ua = all[i];
+                if (ua == null) continue;
+                if (ua == requester) continue;
+
+                // reservedNode or lastAssignedNode claiming this node -> occupied
+                try
+                {
+                    if (ua.reservedNode != null && ua.reservedNode == node) return true;
+                    if (ua.lastAssignedNode != null && ua.lastAssignedNode == node) return true;
+                }
+                catch { }
+
+                // sim position mapped to this node
+                try
+                {
+                    var unitNode = gm.NodeFromWorldPoint(ua.SimPosition);
+                    if (unitNode != null)
+                    {
+                        if (unitNode.gridX == node.gridX && unitNode.gridY == node.gridY) return true;
+                    }
+                }
+                catch { }
+            }
+        }
+        else
+        {
+            // Fallback to FindObjects if registry isn't populated (rare)
+            UnitAgent[] allFound = UnityEngine.Object.FindObjectsOfType<UnitAgent>();
+            for (int i = 0; i < allFound.Length; i++)
+            {
+                var ua = allFound[i];
+                if (ua == null) continue;
+                if (ua == requester) continue;
+
+                try
+                {
+                    if (ua.reservedNode != null && ua.reservedNode == node) return true;
+                    if (ua.lastAssignedNode != null && ua.lastAssignedNode == node) return true;
+                }
+                catch { }
+
+                try
+                {
+                    var unitNode = gm.NodeFromWorldPoint(ua.SimPosition);
+                    if (unitNode != null)
+                    {
+                        if (unitNode.gridX == node.gridX && unitNode.gridY == node.gridY) return true;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        return false;
     }
 }

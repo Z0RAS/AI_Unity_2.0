@@ -214,4 +214,6 @@ public class SelectionController : MonoBehaviour
         selectionBoxUI.anchoredPosition = startPos + size / 2f;
         selectionBoxUI.sizeDelta = new Vector2(Mathf.Abs(size.x), Mathf.Abs(size.y));
     }
+
+ 
 }

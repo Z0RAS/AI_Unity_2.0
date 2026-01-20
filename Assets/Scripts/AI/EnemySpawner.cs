@@ -1,6 +1,5 @@
-using System.Collections;
-using UnityEngine;
 using System.Collections.Generic;
+using UnityEngine;
 
 /// <summary>
 /// Handles spawning of enemy base (castle) and initial villagers.
@@ -51,28 +50,78 @@ public class EnemySpawner : MonoBehaviour
 
     public void SpawnCastleAndInitialWorkers()
     {
-        Vector3 pos = new Vector3(castleSpawnPosition.x, castleSpawnPosition.y, 0f);
-        if (pos == Vector3.zero && GridManager.Instance != null)
+        // Compute initial position (existing behaviour kept as fallback)
+        Vector3 desiredPos = new Vector3(castleSpawnPosition.x, castleSpawnPosition.y, 0f);
+        if (desiredPos == Vector3.zero && GridManager.Instance != null)
         {
             var center = GridManager.Instance.NodeFromWorldPoint(Vector3.zero);
-            if (center != null) pos = center.centerPosition;
+            if (center != null) desiredPos = center.centerPosition;
         }
-        if (pos == Vector3.zero) pos = transform.position;
+        if (desiredPos == Vector3.zero) desiredPos = transform.position;
 
+        // Try to snap castle spawn to canonical footprint center so recruiters reserve outside nodes correctly.
+        Vector3 spawnPos = desiredPos;
+        var gm = GridManager.Instance;
+        try
+        {
+            if (gm != null && castlePrefab != null)
+            {
+                // Determine footprint of castle prefab
+                Vector2Int footprint = Vector2Int.one;
+                var bcPrefab = castlePrefab.GetComponent<BuildingConstruction>();
+                if (bcPrefab != null)
+                {
+                    footprint = bcPrefab.Size;
+                }
+                else
+                {
+                    var bcomp = castlePrefab.GetComponent<Building>();
+                    if (bcomp != null && bcomp.data != null)
+                        footprint = bcomp.data.size;
+                }
+
+                // If we have a grid and a sensible footprint, compute canonical start indices & center.
+                Node baseNode = gm.NodeFromWorldPoint(desiredPos);
+                if (baseNode != null)
+                {
+                    Vector2Int start = gm.GetStartIndicesForCenteredFootprint(desiredPos, footprint);
+                    Node first = gm.GetNode(start.x, start.y);
+                    Node last = gm.GetNode(start.x + footprint.x - 1, start.y + footprint.y - 1);
+                    if (first != null && last != null)
+                    {
+                        spawnPos = (first.centerPosition + last.centerPosition) * 0.5f;
+                    }
+                }
+            }
+        }
+        catch { spawnPos = desiredPos; }
+
+        // Instantiate castle at the aligned spawnPos
         if (castlePrefab == null)
         {
             Debug.LogWarning("[EnemySpawner] castlePrefab not assigned.");
             return;
         }
 
-        castleInstance = Instantiate(castlePrefab, pos, Quaternion.identity, spawnParent);
+        castleInstance = Instantiate(castlePrefab, spawnPos, Quaternion.identity, spawnParent);
 
         var bc = castleInstance.GetComponent<BuildingConstruction>();
-        if (bc != null) 
+        if (bc != null)
         {
+            // Ensure buildingNode follows the canonical footprint node if possible
+            try
+            {
+                if (gm != null)
+                    bc.buildingNode = gm.NodeFromWorldPoint(spawnPos);
+            }
+            catch { }
+
             bc.assignedOwner = enemyEconomy;
             bc.isUnderConstruction = true; // Castle starts as construction site
             bc.currentHealth = 0f; // Needs to be built from scratch
+
+            // Make colliders non-blocking while under construction (helps recruiter/reservations)
+            try { bc.SetCollidersAsTrigger(true); } catch { }
         }
 
         var buildingComp = castleInstance.GetComponent<Building>();

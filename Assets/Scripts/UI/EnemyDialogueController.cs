@@ -1,12 +1,12 @@
-﻿    using System.Collections;
-using System.Collections.Generic;
-using UnityEngine;
-using UnityEngine.UI;
+﻿using System.Collections.Generic;
 using TMPro;
+using UnityEngine;
+using System.Collections;
+using System.Linq;
 
 /// <summary>
-/// Central enemy dialogue controller with a lightweight queue, portrait float-in and letter-by-letter reveal.
-/// Backwards-compatible Speak(...) API retained.
+/// Central enemy dialogue controller with a lightweight queue.
+/// Backwards-compatible Speak(...) API retained (portrait parameter is ignored).
 /// </summary>
 [DisallowMultipleComponent]
 public class EnemyDialogueController : MonoBehaviour
@@ -20,31 +20,15 @@ public class EnemyDialogueController : MonoBehaviour
     [Tooltip("TextMeshProUGUI used for the message.")]
     public TextMeshProUGUI messageText;
 
-    // public Image portraitImage; // Removed - portrait is now part of dialogueObject
-
-    // public RectTransform portraitTransform; // Removed - now auto-found from portrait image
-
-    // Get portrait image from dialogue object
-    private Image PortraitImage => dialogueObject?.GetComponentInChildren<Image>();
-
-    // Get portrait transform from portrait image
-    private RectTransform PortraitTransform => PortraitImage?.rectTransform;
-
-    // public Sprite kingPortrait; // Removed - king portrait should be set on the dialogue object
-
-    [Header("Timing / animation")]
+    [Header("Timing")]
     public float defaultDuration = 3.0f;
-    [Tooltip("Seconds for the portrait float-in animation.")]
-    public float portraitFloatDuration = 0.32f;
-    [Tooltip("Start offset (local anchored) for the portrait animation.")]
-    public Vector2 portraitStartOffset = new Vector2(0f, -42f);
     [Tooltip("Delay per-character when revealing text.")]
     public float letterDelay = 0.03f;
     [Tooltip("Optional minimum time a message should remain on screen (prevents too quick flicker).")]
     public float minDisplayTime = 0.6f;
 
-    // internal queue
-    struct DialogMessage { public string text; public Sprite portrait; public float duration; }
+    // internal queue (portrait is intentionally NOT tracked)
+    struct DialogMessage { public string text; public float duration; }
     readonly Queue<DialogMessage> queue = new Queue<DialogMessage>();
 
     Coroutine workerCoroutine;
@@ -91,20 +75,46 @@ public class EnemyDialogueController : MonoBehaviour
             return;
         }
         Instance = this;
+
+        // Attempt to find children even if dialogueObject is disabled in scene
+        TryCacheUiRefs();
     }
 
     private void Start()
     {
+        // Keep hidden by default (safe even if already disabled)
         if (dialogueObject != null)
             dialogueObject.SetActive(false);
-        if (PortraitImage != null)
-            PortraitImage.enabled = false;
+
+        // Ensure we have references to messageText (handles disabled dialogueObject case)
+        TryCacheUiRefs();
+    }
+
+    // Try to locate messageText even if dialogueObject is disabled in scene.
+    // Use GetComponentsInChildren(includeInactive:true) to find children on disabled GameObject.
+    void TryCacheUiRefs()
+    {
+        if (dialogueObject != null)
+        {
+            if (messageText == null)
+            {
+                messageText = dialogueObject.GetComponentsInChildren<TextMeshProUGUI>(true).FirstOrDefault();
+                if (messageText == null)
+                    Debug.LogWarning("[EnemyDialogue] messageText not assigned and could not be found under dialogueObject.");
+            }
+        }
+        else
+        {
+            Debug.LogWarning("[EnemyDialogue] dialogueObject not assigned in inspector. Assign scene UI root for dialogue.");
+        }
     }
 
     // Core display API used by other game code --------------------------------
 
     /// <summary>
     /// Backwards-compatible Speak. Enqueues the message for sequential display.
+    /// The optional portrait parameter is accepted for API compatibility but intentionally ignored;
+    /// the portrait is considered part of the dialogueObject and is not modified here.
     /// </summary>
     public void Speak(string message, Sprite portrait = null, float duration = -1f)
     {
@@ -115,9 +125,15 @@ public class EnemyDialogueController : MonoBehaviour
         foreach (var m in queue)
             if (m.text == message) return;
 
-        queue.Enqueue(new DialogMessage { text = message, portrait = portrait, duration = duration });
+        // Debug trace so it's easy to see Speak calls when dialogueObject is disabled
+        Debug.Log($"[EnemyDialogue] Enqueue message: \"{message}\" (dialogueObject assigned: {dialogueObject != null}, messageText assigned: {messageText != null})");
+
+        // Note: portrait is intentionally NOT stored or modified here.
+        queue.Enqueue(new DialogMessage { text = message, duration = duration });
         if (workerCoroutine == null)
+        {
             workerCoroutine = StartCoroutine(ProcessQueue());
+        }
     }
 
     public void SpeakFirstContact(Sprite portrait = null)
@@ -159,56 +175,34 @@ public class EnemyDialogueController : MonoBehaviour
 
     IEnumerator ProcessQueue()
     {
+        Debug.Log($"[EnemyDialogue] ProcessQueue started (queued items: {queue.Count})");
         while (queue.Count > 0)
         {
             var msg = queue.Dequeue();
-            yield return StartCoroutine(DisplayMessageCoroutine(msg.text, msg.portrait, msg.duration));
+            yield return StartCoroutine(DisplayMessageCoroutine(msg.text, msg.duration));
         }
 
         workerCoroutine = null;
+        Debug.Log("[EnemyDialogue] ProcessQueue finished");
     }
 
-    IEnumerator DisplayMessageCoroutine(string message, Sprite portrait, float duration)
+    IEnumerator DisplayMessageCoroutine(string message, float duration)
     {
         if (duration < minDisplayTime) duration = minDisplayTime;
+
+        // Ensure UI refs in case they were not cached earlier
+        TryCacheUiRefs();
 
         // show root
         if (dialogueObject != null)
             dialogueObject.SetActive(true);
-
-        // portrait setup + float-in
-        if (PortraitImage != null)
+        else
         {
-            if (portrait != null)
-            {
-                PortraitImage.sprite = portrait;
-                PortraitImage.enabled = true;
-
-                if (PortraitTransform != null)
-                {
-                    Vector2 target = PortraitTransform.anchoredPosition;
-                    Vector2 start = target + portraitStartOffset;
-                    PortraitTransform.anchoredPosition = start;
-
-                    float t = 0f;
-                    while (t < portraitFloatDuration)
-                    {
-                        t += Time.deltaTime;
-                        float p = Mathf.Clamp01(t / portraitFloatDuration);
-                        // smooth step
-                        PortraitTransform.anchoredPosition = Vector2.Lerp(start, target, Mathf.SmoothStep(0f, 1f, p));
-                        yield return null;
-                    }
-                    PortraitTransform.anchoredPosition = target;
-                }
-            }
-            else
-            {
-                PortraitImage.enabled = false;
-            }
+            Debug.LogWarning("[EnemyDialogue] dialogueObject is null when trying to display message.");
+            yield break;
         }
 
-        // reveal text letter-by-letter
+        // reveal text letter-by-letter (portrait is not handled here; it's part of dialogueObject)
         if (messageText != null)
         {
             messageText.text = string.Empty;
@@ -217,6 +211,10 @@ public class EnemyDialogueController : MonoBehaviour
                 messageText.text += message[i];
                 yield return new WaitForSeconds(letterDelay);
             }
+        }
+        else
+        {
+            Debug.LogWarning("[EnemyDialogue] messageText is not assigned, cannot display text.");
         }
 
         // hold on screen for duration
@@ -227,9 +225,7 @@ public class EnemyDialogueController : MonoBehaviour
             yield return null;
         }
 
-        // hide portrait and dialogue root (simple instant hide to avoid long exit animations)
-        if (PortraitImage != null)
-            PortraitImage.enabled = false;
+        // hide dialogue root only; do not touch portrait Image component
         if (dialogueObject != null)
             dialogueObject.SetActive(false);
     }
@@ -249,15 +245,5 @@ public class EnemyDialogueController : MonoBehaviour
 
         if (dialogueObject != null)
             dialogueObject.SetActive(false);
-        if (PortraitImage != null)
-            PortraitImage.enabled = false;
-        if (displayCoroutine != null)
-        {
-            StopCoroutine(displayCoroutine);
-            displayCoroutine = null;
-        }
     }
-
-    // internal: support canceling single reveal coroutine if needed
-    Coroutine displayCoroutine;
 }

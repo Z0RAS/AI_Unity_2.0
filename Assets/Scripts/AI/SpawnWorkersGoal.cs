@@ -36,16 +36,10 @@ public class SpawnWorkersGoal : IGoal
         var econ = owner.EnemyEconomy;
         if (econ == null) return;
 
-        // IMPORTANT: do not spawn additional villagers while the castle (the base) is still under construction.
-        var castle = owner.CastleInstance;
-        if (castle != null)
-        {
-            var bc = castle.GetComponent<BuildingConstruction>();
-                if (bc != null && !bc.isFinished)
-                {
-                    return;
-                }
-        }
+        // NOTE: allow spawning even while castle construction is ongoing.
+        // Original behavior blocked spawning until castle finished which can deadlock
+        // when no builders are assigned and castle never completes.
+        // (We still avoid spawning beyond population cap below.)
 
         // If we're below population cap, spawn a worker (use WorkerUnitData costs)
         if (econ.population < econ.populationCap)
@@ -67,6 +61,7 @@ public class SpawnWorkersGoal : IGoal
                 }
                 else
                 {
+                    // Not enough resources; skip this tick
                 }
                 return;
             }
@@ -80,16 +75,16 @@ public class SpawnWorkersGoal : IGoal
             {
                 // Ensure we have the required wood (use configured threshold)
                 int requiredWood = owner.woodToBuildHouse;
-                    if (econ.wood < requiredWood)
-                    {
-                        return;
-                    }
+                if (econ.wood < requiredWood)
+                {
+                    return;
+                }
 
                 // Spend wood (best-effort). If TrySpend fails, skip.
-                    if (!econ.TrySpend(requiredWood, 0, 0, 0, 0))
-                    {
-                        return;
-                    }
+                if (!econ.TrySpend(requiredWood, 0, 0, 0, 0))
+                {
+                    return;
+                }
 
                 GameObject placed = null;
                 try
@@ -114,7 +109,7 @@ public class SpawnWorkersGoal : IGoal
                     {
                         try { AssignWorkersToConstruction(bc, Mathf.Min(3, owner.Workers != null ? owner.Workers.Count : 0)); } catch { }
                     }
-                    
+
                 }
                 else
                 {
@@ -151,7 +146,7 @@ public class SpawnWorkersGoal : IGoal
                 for (int y = -radius; y <= radius; y++)
                 {
                     if (Mathf.Abs(x) + Mathf.Abs(y) != radius) continue; // Only check perimeter
-                    
+
                     Node candidate = gm.GetNode(center.gridX + x, center.gridY + y);
                     if (candidate != null && candidate.walkable)
                     {
@@ -186,7 +181,7 @@ public class SpawnWorkersGoal : IGoal
             owner.Workers.Add(workerInstance);
         }
 
-        
+
     }
 
     private GameObject TryPlaceBuilding(GameObject prefab, bool isHouse)
@@ -211,13 +206,13 @@ public class SpawnWorkersGoal : IGoal
                 for (int y = -radius; y <= radius; y++)
                 {
                     if (Mathf.Abs(x) + Mathf.Abs(y) != radius) continue; // Only check perimeter
-                    
+
                     Node candidate = gm.GetNode(center.gridX + x, center.gridY + y);
                     if (candidate != null && candidate.walkable)
                     {
                         // Check if this location is suitable for building
                         Vector3 worldPos = candidate.centerPosition;
-                        
+
                         // Make sure no other buildings are too close
                         bool canPlace = true;
                         var buildings = UnityEngine.Object.FindObjectsOfType<Building>();
@@ -229,23 +224,23 @@ public class SpawnWorkersGoal : IGoal
                                 break;
                             }
                         }
-                        
+
                         if (canPlace)
                         {
                             // Place the building
                             GameObject buildingInstance = UnityEngine.Object.Instantiate(prefab, worldPos, Quaternion.identity);
                             buildingInstance.name = prefab.name;
-                            
+
                             // Set ownership
                             var buildingComponent = buildingInstance.GetComponent<Building>();
                             if (buildingComponent != null)
                             {
                                 buildingComponent.owner = owner.EnemyEconomy;
                             }
-                            
+
                             // Mark node as occupied
                             // candidate.occupied = true;
-                            
+
                             return buildingInstance;
                         }
                     }
@@ -271,21 +266,21 @@ public class SpawnWorkersGoal : IGoal
                 if (candidate != null && candidate.walkable && !NodeReservationSystem.Instance.IsReserved(candidate))
                 {
                     Vector3 worldPos = candidate.centerPosition;
-                    
+
                     // Place the building
                     GameObject buildingInstance = UnityEngine.Object.Instantiate(prefab, worldPos, Quaternion.identity);
                     buildingInstance.name = prefab.name + "_Forced";
-                    
+
                     // Set ownership
                     var buildingComponent = buildingInstance.GetComponent<Building>();
                     if (buildingComponent != null)
                     {
                         buildingComponent.owner = owner.EnemyEconomy;
                     }
-                    
+
                     // Mark node as occupied
                     candidate.walkable = false;
-                    
+
                     return buildingInstance;
                 }
             }

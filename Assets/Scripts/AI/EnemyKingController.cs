@@ -1,7 +1,7 @@
-﻿using System.Collections;
-using UnityEngine;
+﻿using AI.BehaviorTree;
 using System.Collections.Generic;
-using AI.BehaviorTree;
+using UnityEngine;
+using System.Collections;
 
 /// <summary>
 /// Thin facade for enemy systems. Keeps only high level orchestration (spawn, expose APIs, enqueue goals).
@@ -69,6 +69,11 @@ public class EnemyKingController : MonoBehaviour
         StartCoroutine(StuckFixLoop(5f));
         // Enqueue castle build goal as first priority
         StartCoroutine(EnqueueCastleBuildGoal());
+
+        // Ensure DetectGoal is enqueued at startup (delayed slightly so spawner/planner can initialize).
+        // Previously detect was skipped in some code paths; this guarantees the detect goal runs once early.
+        StartCoroutine(EnsureDetectGoalInitialized());
+
         aiInitialized = true;
     }
 
@@ -158,9 +163,10 @@ public class EnemyKingController : MonoBehaviour
                 new ActionNode(() => { EnqueueScoutGoal(); return NodeState.Success; })
             ),
 
-            // Priority 2: Spawn workers if below minimum
+            // Priority 2: Spawn workers when population is below cap (always keep economy growing)
             new Sequence(
-                new ConditionNode(() => Workers.Count < initialWorkers),
+                // changed: spawn based on population (not based on Workers.Count < initialWorkers)
+                new ConditionNode(() => EnemyEconomy != null && EnemyEconomy.population < EnemyEconomy.populationCap),
                 new ActionNode(() => { EnqueueSpawnWorkersGoal(); return NodeState.Success; })
             ),
 
@@ -255,7 +261,7 @@ public class EnemyKingController : MonoBehaviour
             if (target != null && target.walkable)
             {
                 unit.SetDestinationToNode(target);
-                
+
                 return;
             }
         }
@@ -305,29 +311,41 @@ public class EnemyKingController : MonoBehaviour
     {
         // Wait for spawner to initialize
         yield return new WaitForEndOfFrame();
-        
+
         if (enemySpawner != null && enemySpawner.CastleInstance != null)
         {
+            // Ensure construction component exists and is started, then ask recruiter to alert villagers
+            var castleInst = enemySpawner.CastleInstance;
+            var bc = castleInst.GetComponent<BuildingConstruction>();
+            try
+            {
+                if (bc != null)
+                {
+                    if (EnemyEconomy != null) bc.assignedOwner = EnemyEconomy;
+                    if (!bc.isUnderConstruction) bc.BeginConstruction();
+                    try { bc.AlertNearbyIdleVillagers(); } catch { }
+                }
+            }
+            catch { /* best-effort only */ }
+
+            // Enqueue a BuildGoal to track/finish/register the building as before
             var planner = FindObjectOfType<GoalPlanner>();
             if (planner != null)
             {
-                // Create build goal for the existing castle instance
                 var buildGoal = new BuildGoal(this, enemySpawner.CastleInstance, 120f);
                 planner.EnqueueGoal(buildGoal);
-                
             }
         }
     }
 
-    void EnqueueGoals()
+    // New: ensure detect goal runs once at startup (delayed so planner/enemySpawner are ready)
+    private IEnumerator EnsureDetectGoalInitialized()
     {
-        var planner = FindObjectOfType<GoalPlanner>();
-        if (planner == null) return;
+        // small delay to allow planner/spawner to initialize
+        yield return new WaitForSeconds(0.25f);
 
-        planner.EnqueueGoal(new ScoutGoal(this, minScoutCount, maxScoutCount, scoutRadius, scoutMoveInterval, 60f, () => FirstContactAnnounced));
-        planner.EnqueueGoal(new SpawnWorkersGoal(this, workerSpawnInterval));
-        planner.EnqueueGoal(new DetectGoal(this, detectRadius, detectInterval));
-        planner.EnqueueGoal(new ResourceScoutGoal(this, resourceScoutCount, resourceScoutInterval, () => resourceDiscoveryCompleted));
-        planner.EnqueueGoal(new TrainUnitsGoal(this, troopBatchSize));
+        // If resource discovery isn't complete, enqueue a detect goal to kick off detection.
+        if (!resourceDiscoveryCompleted)
+            EnqueueDetectGoal();
     }
 }

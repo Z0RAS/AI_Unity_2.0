@@ -37,16 +37,53 @@ public class TrainUnitsGoal : IGoal
         var econ = owner.EnemyEconomy;
         if (econ == null) return;
 
-        // If no barracks and prefab present, attempt to place barracks when we have enough wood
+        // If no barracks and prefab present, attempt to place barracks when we have enough resources.
+        // Use the actual prefab BuildingData costs when available (fixes mismatch vs owner.woodToBuildBarracks).
         if ((owner.Barracks == null || owner.Barracks.Count == 0) && owner.barracksPrefab != null)
         {
-            if (econ.wood >= owner.woodToBuildBarracks)
+            int barrackWoodCost = owner.woodToBuildBarracks;
+            int barrackIronCost = 0;
+            int barrackGoldCost = 0;
+            int barrackFoodCost = 0;
+
+            try
+            {
+                var bcPrefab = owner.barracksPrefab.GetComponent<BuildingConstruction>();
+                if (bcPrefab != null && bcPrefab.data != null)
+                {
+                    barrackWoodCost = bcPrefab.data.woodCost;
+                    barrackIronCost = bcPrefab.data.ironCost;
+                    barrackGoldCost = bcPrefab.data.goldCost;
+                    barrackFoodCost = bcPrefab.data.foodCost;
+                }
+                else
+                {
+                    var bcomp = owner.barracksPrefab.GetComponent<Building>();
+                    if (bcomp != null && bcomp.data != null)
+                    {
+                        barrackWoodCost = bcomp.data.woodCost;
+                        barrackIronCost = bcomp.data.ironCost;
+                        barrackGoldCost = bcomp.data.goldCost;
+                        barrackFoodCost = bcomp.data.foodCost;
+                    }
+                }
+            }
+            catch { /* best-effort, fall back to owner.woodToBuildBarracks */ }
+
+            if (econ.wood >= barrackWoodCost && econ.iron >= barrackIronCost)
             {
                 var placed = TryPlaceBuilding(owner.barracksPrefab, false);
                 if (placed != null)
                 {
-                    if (econ.TrySpend(owner.woodToBuildBarracks, 0, 0, 0))
+                    // Try to spend the actual building costs. If spend fails, cleanup placed prefab.
+                    if (econ.TrySpend(barrackWoodCost, barrackIronCost, barrackGoldCost, barrackFoodCost, 0))
+                    {
                         owner.StartCoroutine(RegisterBarracksWhenReady(placed));
+                    }
+                    else
+                    {
+                        try { UnityEngine.Object.Destroy(placed); } catch { }
+                    }
                 }
                 return;
             }
@@ -88,10 +125,10 @@ public class TrainUnitsGoal : IGoal
             catch
             {
                 // if instantiation fails, refund population/resource to avoid leaks
+                econ.AddResource(ResourceType.Food, preferred.foodCost);
                 econ.AddResource(ResourceType.Wood, preferred.woodCost);
                 econ.AddResource(ResourceType.Iron, preferred.stoneCost);
                 econ.AddResource(ResourceType.Gold, preferred.goldCost);
-                econ.AddResource(ResourceType.Food, preferred.foodCost);
                 econ.population = Mathf.Max(0, econ.population - 1);
                 break;
             }
@@ -110,8 +147,8 @@ public class TrainUnitsGoal : IGoal
     private bool CanAfford(PlayerEconomy econ, UnitData unitData)
     {
         if (econ == null || unitData == null) return false;
-        return econ.wood >= unitData.woodCost && 
-               econ.gold >= unitData.goldCost && 
+        return econ.wood >= unitData.woodCost &&
+               econ.gold >= unitData.goldCost &&
                econ.food >= unitData.foodCost &&
                econ.population < econ.populationCap; // Check if we can afford population increase
     }
@@ -136,7 +173,7 @@ public class TrainUnitsGoal : IGoal
                 for (int y = -radius; y <= radius; y++)
                 {
                     if (Mathf.Abs(x) + Mathf.Abs(y) != radius) continue; // Only check perimeter
-                    
+
                     Node candidate = gm.GetNode(center.gridX + x, center.gridY + y);
                     if (candidate != null && candidate.walkable)
                     {
@@ -171,13 +208,13 @@ public class TrainUnitsGoal : IGoal
                 for (int y = -radius; y <= radius; y++)
                 {
                     if (Mathf.Abs(x) + Mathf.Abs(y) != radius) continue; // Only check perimeter
-                    
+
                     Node candidate = gm.GetNode(center.gridX + x, center.gridY + y);
                     if (candidate != null && candidate.walkable)
                     {
                         // Check if this location is suitable for building
                         Vector3 worldPos = candidate.centerPosition;
-                        
+
                         // Make sure no other buildings are too close
                         bool canPlace = true;
                         var buildings = UnityEngine.Object.FindObjectsOfType<Building>();
@@ -189,23 +226,23 @@ public class TrainUnitsGoal : IGoal
                                 break;
                             }
                         }
-                        
+
                         if (canPlace)
                         {
                             // Place the building
                             GameObject buildingInstance = UnityEngine.Object.Instantiate(prefab, worldPos, Quaternion.identity);
                             buildingInstance.name = prefab.name;
-                            
+
                             // Set ownership
                             var buildingComponent = buildingInstance.GetComponent<Building>();
                             if (buildingComponent != null)
                             {
                                 buildingComponent.owner = owner.EnemyEconomy;
                             }
-                            
+
                             // Mark node as occupied
                             // candidate.occupied = true;
-                            
+
                             return buildingInstance;
                         }
                     }
@@ -227,7 +264,7 @@ public class TrainUnitsGoal : IGoal
                 yield return null;
             }
         }
-        
+
         // Register the barracks with the owner
         if (!owner.Barracks.Contains(barracksInstance))
         {

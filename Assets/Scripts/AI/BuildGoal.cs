@@ -64,7 +64,7 @@ public class BuildGoal : IGoal
                     if (!bc.isUnderConstruction)
                     {
                         bc.BeginConstruction();
-                        
+
                     }
                 }
                 catch { }
@@ -117,11 +117,29 @@ public class BuildGoal : IGoal
         var gm = GridManager.Instance;
         if (gm == null) return null;
 
+        // Determine footprint size for the prefab (prefer BuildingConstruction on prefab, fallback to BuildingData.size).
+        Vector2Int footprint = Vector2Int.one;
+        try
+        {
+            var bcPrefab = prefab.GetComponent<BuildingConstruction>();
+            if (bcPrefab != null)
+                footprint = bcPrefab.Size;
+            else
+            {
+                var bcomp = prefab.GetComponent<Building>();
+                if (bcomp != null && bcomp.data != null)
+                {
+                    footprint = bcomp.data.size;
+                }
+            }
+        }
+        catch { footprint = Vector2Int.one; }
+
         // Find a suitable location near the castle
         Node center = gm.NodeFromWorldPoint(castle.transform.position);
         if (center == null) return null;
 
-        // Search for a suitable building location
+        // Search for a suitable building location (expand rings around castle)
         for (int radius = 2; radius <= 8; radius++)
         {
             for (int x = -radius; x <= radius; x++)
@@ -129,44 +147,117 @@ public class BuildGoal : IGoal
                 for (int y = -radius; y <= radius; y++)
                 {
                     if (Mathf.Abs(x) + Mathf.Abs(y) != radius) continue; // Only check perimeter
-                    
-                    Node candidate = gm.GetNode(center.gridX + x, center.gridY + y);
-                    if (candidate != null && candidate.walkable)
+
+                    Node candidateCenterNode = gm.GetNode(center.gridX + x, center.gridY + y);
+                    if (candidateCenterNode == null || !candidateCenterNode.walkable) continue;
+
+                    // Compute start indices for footprint centered at this candidate node's world pos
+                    Vector3 candidateWorld = candidateCenterNode.centerPosition;
+                    Vector2Int start = gm.GetStartIndicesForCenteredFootprint(candidateWorld, footprint);
+
+                    // Validate all nodes within footprint exist & are walkable
+                    bool canPlace = true;
+                    for (int dx = 0; dx < footprint.x && canPlace; dx++)
                     {
-                        // Check if this location is suitable for building
-                        Vector3 worldPos = candidate.centerPosition;
-                        
-                        // Make sure no other buildings are too close
-                        bool canPlace = true;
-                        var buildings = UnityEngine.Object.FindObjectsOfType<Building>();
-                        foreach (var building in buildings)
+                        for (int dy = 0; dy < footprint.y; dy++)
                         {
-                            if (Vector3.Distance(worldPos, building.transform.position) < 2f)
+                            Node n = gm.GetNode(start.x + dx, start.y + dy);
+                            if (n == null || !n.walkable)
                             {
                                 canPlace = false;
                                 break;
                             }
-                        }
-                        
-                        if (canPlace)
-                        {
-                            // Place the building
-                            GameObject buildingInstance = UnityEngine.Object.Instantiate(prefab, worldPos, Quaternion.identity);
-                            buildingInstance.name = prefab.name;
-                            
-                            // Set ownership
-                            var buildingComponent = buildingInstance.GetComponent<Building>();
-                            if (buildingComponent != null)
+
+                            // optional: skip if reserved (prevent placing on reserved nodes)
+                            if (NodeReservationSystem.Instance != null && NodeReservationSystem.Instance.IsReserved(n))
                             {
-                                buildingComponent.owner = owner.EnemyEconomy;
+                                canPlace = false;
+                                break;
                             }
-                            
-                            // Mark node as occupied
-                            // candidate.occupied = true;
-                            
-                            return buildingInstance;
+
+                            // optional: avoid placing on resource nodes / units overlapping footprint
+                            Collider2D[] hits = null;
+                            try
+                            {
+                                hits = Physics2D.OverlapCircleAll(n.centerPosition, gm.nodeDiameter * 0.45f);
+                            }
+                            catch { hits = null; }
+
+                            if (hits != null)
+                            {
+                                foreach (var h in hits)
+                                {
+                                    if (h == null) continue;
+                                    if (h.GetComponent<ResourceNode>() != null) { canPlace = false; break; }
+
+                                    var ua = h.GetComponent<UnitAgent>();
+                                    if (ua != null)
+                                    {
+                                        Node unitNode = gm.NodeFromWorldPoint(ua.transform.position);
+                                        if (unitNode != null && unitNode.gridX == n.gridX && unitNode.gridY == n.gridY)
+                                        {
+                                            canPlace = false;
+                                            break;
+                                        }
+                                    }
+
+                                    // building mask collisions are expensive to determine here; skip strict mask checks
+                                }
+
+                                if (!canPlace) break;
+                            }
                         }
                     }
+
+                    if (!canPlace) continue;
+
+                    // Make sure no other buildings are too close (conservative check using centers)
+                    Vector3 firstNodeWorld = gm.GetNode(start.x, start.y).centerPosition;
+                    Vector3 lastNodeWorld = gm.GetNode(start.x + footprint.x - 1, start.y + footprint.y - 1).centerPosition;
+                    Vector3 footprintCenter = (firstNodeWorld + lastNodeWorld) * 0.5f;
+
+                    bool tooClose = false;
+                    var buildings = UnityEngine.Object.FindObjectsOfType<Building>();
+                    foreach (var building in buildings)
+                    {
+                        if (building == null) continue;
+                        if (Vector3.Distance(footprintCenter, building.transform.position) < 1.8f)
+                        {
+                            tooClose = true;
+                            break;
+                        }
+                    }
+
+                    if (tooClose) continue;
+
+                    // Place the building at the precise footprint center
+                    GameObject buildingInstance = UnityEngine.Object.Instantiate(prefab, footprintCenter, Quaternion.identity);
+                    buildingInstance.name = prefab.name;
+
+                    // Set ownership
+                    var buildingComponent = buildingInstance.GetComponent<Building>();
+                    if (buildingComponent != null)
+                    {
+                        buildingComponent.owner = owner.EnemyEconomy;
+                    }
+
+                    // If it's a BuildingConstruction, ensure BuildingNode/position is aligned (BuildingConstruction.Awake tries to set buildingNode)
+                    try
+                    {
+                        var bcInst = buildingInstance.GetComponent<BuildingConstruction>();
+                        if (bcInst != null)
+                        {
+                            // Snap transform to the canonical center to avoid rounding/placement drift
+                            if (gm != null && bcInst.buildingNode == null)
+                                bcInst.buildingNode = gm.NodeFromWorldPoint(footprintCenter);
+
+                            // ensure transform is precisely set to footprint center
+                            buildingInstance.transform.position = footprintCenter;
+                        }
+                    }
+                    catch { }
+
+                    return buildingInstance;
                 }
             }
         }
@@ -185,7 +276,7 @@ public class BuildGoal : IGoal
                 yield return null;
             }
         }
-        
+
         // Register the barracks with the owner
         if (!owner.Barracks.Contains(barracksInstance))
         {

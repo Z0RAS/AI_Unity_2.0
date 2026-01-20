@@ -5,8 +5,8 @@ using UnityEngine;
 
 /// <summary>
 /// Improved scout: soldiers (non-villagers) perform exploration biased toward map center (0,0).
-/// Villagers still prefer undiscovered resource nodes. Keeps lightweight visited maps to avoid repeats.
-/// Also contains a per-unit movement watchdog so stalled/idle scouts get reassigned.
+/// Villagers are NOT used as scouts (they remain for economy/build tasks).
+/// Keeps lightweight visited maps to avoid repeats and a movement watchdog so stalled/idle scouts get reassigned.
 /// </summary>
 public class ScoutGoal : IGoal
 {
@@ -24,9 +24,6 @@ public class ScoutGoal : IGoal
     private float startTime;
     private bool started;
     private bool aborted;
-
-    // Persistent across all ScoutGoal instances: resource nodes we've already sent villagers to
-    private static readonly HashSet<int> visitedResourceNodeIds = new HashSet<int>();
 
     // Grid cells we've visited (so exploration doesn't revisit same tiles)
     private static readonly HashSet<Vector2Int> visitedCells = new HashSet<Vector2Int>();
@@ -71,12 +68,9 @@ public class ScoutGoal : IGoal
         var gm = GridManager.Instance;
         if (castle == null) return;
 
-        // If castle is still under construction, do not send villagers to scout/gather — allow builders to finish first.
+        // If castle is still under construction, allow soldiers to scout but avoid sending villagers away
         var castleBc = castle.GetComponent<BuildingConstruction>();
-        if (castleBc != null && !castleBc.isFinished)
-        {
-            return;
-        }
+        bool castleUnderConstruction = (castleBc != null && !castleBc.isFinished);
 
         // Soldier exploration (non-villagers): pick progressive targets toward map center (0,0)
         var allUnits = UnityEngine.Object.FindObjectsOfType<UnitAgent>();
@@ -98,7 +92,7 @@ public class ScoutGoal : IGoal
             if (destNode != null)
             {
                 visitedCells.Add(new Vector2Int(destNode.gridX, destNode.gridY));
-                    TrySendSoldierToNode(ua, destNode);
+                TrySendSoldierToNode(ua, destNode);
                 continue;
             }
 
@@ -112,54 +106,7 @@ public class ScoutGoal : IGoal
             }
         }
 
-        // Villager resource scouting: prefer undiscovered resource nodes (closest)
-        var villCandidates = allUnits
-            .Where(u => u != null && u.owner == econ && u.category == UnitCategory.Villager)
-            .OrderBy(u => (u.transform.position - castle.transform.position).sqrMagnitude)
-            .ToList();
-
-        int willSendVill = Math.Min(maxScouts, villCandidates.Count);
-        for (int i = 0; i < willSendVill; i++)
-        {
-            var ua = villCandidates[i];
-            if (ua == null) continue;
-
-            // If unit is still moving and not stuck, skip reassigning this tick.
-            if (!ShouldAssignNewTarget(ua)) continue;
-
-            ResourceNode pick = FindNearestUnvisitedResource(ua.transform.position, radius);
-            if (pick != null)
-            {
-                visitedResourceNodeIds.Add(pick.GetInstanceID());
-                Vector3 destWorld = pick.transform.position;
-                var spots = pick.GetHarvestSpots();
-                if (spots != null && spots.Count > 0)
-                    destWorld = spots.OrderBy(s => (s - ua.transform.position).sqrMagnitude).First();
-
-                Node destNode = gm != null ? gm.NodeFromWorldPoint(destWorld) : null;
-                if (destNode == null && gm != null)
-                    destNode = gm.FindClosestWalkableNode(Mathf.RoundToInt(destWorld.x), Mathf.RoundToInt(destWorld.y));
-
-                if (destNode != null)
-                {
-                    visitedCells.Add(new Vector2Int(destNode.gridX, destNode.gridY));
-                    TrySendVillagerToNode(ua, destNode);
-                    continue;
-                }
-            }
-
-            // fallback: send villager toward a nearby unvisited cell to help discovery
-            Vector2Int cell = FindUnvisitedCellNearCastle(gm, castle.transform.position, (int)radius);
-            if (cell != default(Vector2Int) && gm != null)
-            {
-                Node destNode = gm.GetNode(cell.x, cell.y) ?? gm.FindClosestWalkableNode(cell.x, cell.y);
-                if (destNode != null)
-                {
-                    visitedCells.Add(new Vector2Int(destNode.gridX, destNode.gridY));
-                    TrySendVillagerToNode(ua, destNode);
-                }
-            }
-        }
+        // NOTE: Villagers are intentionally NOT used as scouts. They remain available for gather/build tasks.
     }
 
     // decide if unit should get a new target: if it has no path OR has been nearly stationary for stillTimeout
@@ -199,64 +146,6 @@ public class ScoutGoal : IGoal
         }
 
         return false;
-    }
-
-    private ResourceNode FindNearestUnvisitedResource(Vector3 from, float searchRadius)
-    {
-        var nodes = ResourceNode.AllNodes;
-        if (nodes == null || nodes.Count == 0) return null;
-
-        ResourceNode best = null;
-        float bestSqr = float.MaxValue;
-        float radiusSqr = searchRadius * searchRadius;
-
-        foreach (var rn in nodes)
-        {
-            if (rn == null) continue;
-            try
-            {
-                if (rn.amount <= 0) continue;
-            }
-            catch { }
-
-            if (visitedResourceNodeIds.Contains(rn.GetInstanceID())) continue;
-
-            float dsq = (rn.transform.position - from).sqrMagnitude;
-            if (dsq < bestSqr && dsq <= radiusSqr)
-            {
-                bestSqr = dsq;
-                best = rn;
-            }
-        }
-
-        return best;
-    }
-
-    private Vector2Int FindUnvisitedCellNearCastle(GridManager gm, Vector3 castlePos, int maxRadius)
-    {
-        if (gm == null) return default(Vector2Int);
-        Node center = gm.NodeFromWorldPoint(castlePos);
-        if (center == null) return default(Vector2Int);
-
-        for (int r = 1; r <= Math.Max(3, maxRadius); r++)
-        {
-            for (int dx = -r; dx <= r; dx++)
-            {
-                for (int dy = -r; dy <= r; dy++)
-                {
-                    if (Mathf.Abs(dx) != r && Mathf.Abs(dy) != r) continue;
-                    int cx = center.gridX + dx;
-                    int cy = center.gridY + dy;
-                    var key = new Vector2Int(cx, cy);
-                    if (visitedCells.Contains(key)) continue;
-                    var n = gm.GetNode(cx, cy);
-                    if (n == null || !n.walkable) continue;
-                    return key;
-                }
-            }
-        }
-
-        return default(Vector2Int);
     }
 
     private Node FindExplorationNodeForSoldier(UnitAgent ua, GridManager gm, int maxRadius)
@@ -338,18 +227,6 @@ public class ScoutGoal : IGoal
             catch { /* ignore */ }
 
             ua.SetDestinationToNode(node);
-        }
-        catch { }
-    }
-
-    private void TrySendVillagerToNode(UnitAgent ua, Node node)
-    {
-        if (ua == null || node == null) return;
-        try
-        {
-            var vt = ua.GetComponent<VillagerTaskSystem>();
-            if (vt != null) vt.CommandMove(node.centerPosition);
-            else ua.SetDestinationToNode(node);
         }
         catch { }
     }

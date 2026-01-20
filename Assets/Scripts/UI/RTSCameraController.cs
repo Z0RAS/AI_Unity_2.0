@@ -1,6 +1,7 @@
 ﻿using UnityEngine;
 using UnityEngine.Tilemaps;
 using UnityEngine.InputSystem;
+using System.Collections.Generic;
 
 
 public class RTSCameraController : MonoBehaviour
@@ -188,6 +189,86 @@ public class RTSCameraController : MonoBehaviour
             targetZoom = Mathf.Clamp(targetZoom, minZoom, maxZoom);
             cam.orthographicSize = Mathf.Clamp(cam.orthographicSize, minZoom, maxZoom);
         }
+    }
+
+    // Updated helper: more conservative occupancy detection to prevent commanding onto nodes
+    // occupied by units even if they moved since load (checks transform, sim, reserved/assigned).
+    private bool IsNodePhysicallyOccupiedByOther(Node node, List<UnitAgent> ignoreList)
+    {
+        if (node == null) return false;
+
+        var gm = GridManager.Instance;
+        float physRadius = Mathf.Max(gm != null ? gm.nodeDiameter * 0.35f : 0.3f, 0.15f);
+
+        // 1) Physics overlap check (fast common-case)
+        Collider2D[] hits = Physics2D.OverlapCircleAll(node.centerPosition, physRadius);
+        foreach (var h in hits)
+        {
+            if (h == null) continue;
+            var ua = h.GetComponent<UnitAgent>();
+            if (ua == null) continue;
+
+            bool isIgnored = false;
+            if (ignoreList != null)
+            {
+                for (int i = 0; i < ignoreList.Count; i++)
+                {
+                    if (ignoreList[i] == ua) { isIgnored = true; break; }
+                }
+            }
+            if (!isIgnored) return true;
+        }
+
+        // 2) Conservative checks across all units (covers moved-from-onload cases):
+        //    - reservedNode / lastAssignedNode
+        //    - transform-mapped node (unit center)
+        //    - simulation position (tick-driven sim)
+        UnitAgent[] all = Object.FindObjectsOfType<UnitAgent>();
+        foreach (var ua in all)
+        {
+            if (ua == null) continue;
+
+            bool isIgnored = false;
+            if (ignoreList != null)
+            {
+                for (int i = 0; i < ignoreList.Count; i++)
+                {
+                    if (ignoreList[i] == ua) { isIgnored = true; break; }
+                }
+            }
+            if (isIgnored) continue;
+
+            // reserved/assigned node claims
+            try
+            {
+                if (ua.reservedNode != null && ua.reservedNode == node) return true;
+                if (ua.lastAssignedNode != null && ua.lastAssignedNode == node) return true;
+            }
+            catch { }
+
+            // transform center -> node mapping
+            try
+            {
+                if (gm != null)
+                {
+                    var unitNode = gm.NodeFromWorldPoint(ua.transform.position);
+                    if (unitNode != null && unitNode.gridX == node.gridX && unitNode.gridY == node.gridY)
+                        return true;
+                }
+            }
+            catch { }
+
+            // simPosition (tick simulation) check - more robust during/after moves
+            try
+            {
+                Vector3 sim = ua.SimPosition;
+                float d2 = (new Vector2(sim.x - node.centerPosition.x, sim.y - node.centerPosition.y)).sqrMagnitude;
+                if (d2 <= physRadius * physRadius) return true;
+            }
+            catch { }
+        }
+
+        return false;
     }
 
 }

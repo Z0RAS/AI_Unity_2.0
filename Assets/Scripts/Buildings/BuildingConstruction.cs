@@ -1,6 +1,5 @@
 ﻿using System.Collections.Generic;
 using UnityEngine;
-using System.Collections;
 
 [RequireComponent(typeof(AutoBuildRecruiter), typeof(ConstructionFinalizer))]
 public class BuildingConstruction : MonoBehaviour
@@ -143,10 +142,24 @@ public class BuildingConstruction : MonoBehaviour
 
         Vector3 center = buildingNode != null ? buildingNode.centerPosition : transform.position;
 
-        // auto-detect nearby owner-matching villagers (legacy behavior - populate buildersSet)
+        var gm = GridManager.Instance;
+
+        // compute footprint start indices & bounds early so we can exclude inside-footprint units
+        int innerMinX = int.MinValue, innerMinY = int.MinValue, innerMaxX = int.MaxValue, innerMaxY = int.MaxValue;
+        if (gm != null)
+        {
+            Vector2Int start = gm.GetStartIndicesForCenteredFootprint(transform.position, Size);
+            innerMinX = start.x;
+            innerMinY = start.y;
+            innerMaxX = start.x + Size.x - 1;
+            innerMaxY = start.y + Size.y - 1;
+        }
+
+        // auto-detect nearby owner-matching villagers (legacy behavior removed for center counting).
+        // Only consider villagers that are outside the footprint (perimeter/approach nodes) or explicitly assigned.
         Collider2D[] nearby = Physics2D.OverlapCircleAll(center, buildDetectionRadius);
         var nearbyAgents = new HashSet<UnitAgent>();
-        if (nearby != null)
+        if (nearby != null && nearby.Length > 0)
         {
             foreach (var c in nearby)
             {
@@ -160,6 +173,30 @@ public class BuildingConstruction : MonoBehaviour
                 if (assignedOwner != null && ua.owner != assignedOwner)
                     continue;
 
+                // If the unit's current node is inside the footprint, skip it.
+                bool insideFootprint = false;
+                try
+                {
+                    if (gm != null)
+                    {
+                        var node = gm.NodeFromWorldPoint(ua.transform.position);
+                        if (node != null)
+                        {
+                            if (node.gridX >= innerMinX && node.gridX <= innerMaxX && node.gridY >= innerMinY && node.gridY <= innerMaxY)
+                                insideFootprint = true;
+                        }
+                    }
+                }
+                catch { insideFootprint = false; }
+
+                if (insideFootprint)
+                {
+                    // Do NOT count villagers standing inside the footprint/center as active builders.
+                    // Those units may be moving through or were not properly reserved — recruiter reserves outside nodes.
+                    continue;
+                }
+
+                // unit is outside footprint and near building => consider it as a nearby agent (perimeter)
                 nearbyAgents.Add(ua);
 
                 if (!buildersSet.Contains(ua))
@@ -171,16 +208,8 @@ public class BuildingConstruction : MonoBehaviour
         // and villagers explicitly assigned to this construction (player or recruiter).
         try
         {
-            var gm = GridManager.Instance;
             if (gm != null)
             {
-                // footprint start indices & bounds
-                Vector2Int start = gm.GetStartIndicesForCenteredFootprint(transform.position, Size);
-                int innerMinX = start.x;
-                int innerMinY = start.y;
-                int innerMaxX = start.x + Size.x - 1;
-                int innerMaxY = start.y + Size.y - 1;
-
                 // margin: expand sufficiently to include recruiter/reserved approach nodes
                 int margin = Mathf.Clamp(Mathf.Max(Size.x, Size.y) + 4, 1, 8);
 
@@ -200,14 +229,25 @@ public class BuildingConstruction : MonoBehaviour
 
                         bool counted = false;
 
-                        // 1) If villager explicitly assigned to this construction, and at reserved center (if they have a reservation)
+                        // 1) If villager explicitly assigned to this construction, prefer their reserved node center presence
                         if (assignedThis)
                         {
-                            // If reservation present and held & at center -> count and ensure AddBuilder called
                             if (ua.reservedNode != null && ua.holdReservation)
                             {
                                 bool atReservedCenter = false;
                                 try { atReservedCenter = ua.IsAtReservedNodeCenter(0.25f); } catch { atReservedCenter = false; }
+
+                                if (!atReservedCenter)
+                                {
+                                    try
+                                    {
+                                        float dist = Vector2.Distance(ua.transform.position, ua.reservedNode.centerPosition);
+                                        float tol = (gm != null) ? gm.nodeDiameter * 0.9f : 0.9f;
+                                        if (dist <= tol) atReservedCenter = true;
+                                    }
+                                    catch { }
+                                }
+
                                 if (atReservedCenter)
                                 {
                                     try { AddBuilder(ua); } catch { }
@@ -217,15 +257,20 @@ public class BuildingConstruction : MonoBehaviour
                             }
                             else
                             {
-                                // No reserved node: check agent close to an outer-perimeter node or close to building edge.
-                                float distToCenter = Vector2.Distance(ua.transform.position, center);
-                                float threshold = (gm.nodeDiameter * (Mathf.Max(Size.x, Size.y) * 0.5f)) + (gm.nodeDiameter * 0.6f);
-                                if (distToCenter <= threshold)
+                                // If assigned but no reservation, count them only if they stand outside footprint near the building edge
+                                try
                                 {
-                                    try { AddBuilder(ua); } catch { }
-                                    nearbyAgents.Add(ua);
-                                    counted = true;
+                                    float distToCenter = Vector2.Distance(ua.transform.position, center);
+                                    float halfFootprint = Mathf.Max(Size.x, Size.y) * 0.5f * gm.nodeDiameter;
+                                    float edgeTol = gm.nodeDiameter * 1.2f;
+                                    if (distToCenter <= halfFootprint + edgeTol && !IsPositionInsideFootprint(ua.transform.position, gm, innerMinX, innerMinY, innerMaxX, innerMaxY))
+                                    {
+                                        try { AddBuilder(ua); } catch { }
+                                        nearbyAgents.Add(ua);
+                                        counted = true;
+                                    }
                                 }
+                                catch { }
                             }
                         }
 
@@ -238,18 +283,46 @@ public class BuildingConstruction : MonoBehaviour
                             if (rn.gridX >= innerMinX - margin && rn.gridX <= innerMaxX + margin &&
                                 rn.gridY >= innerMinY - margin && rn.gridY <= innerMaxY + margin)
                             {
-                                bool insideFootprint = (rn.gridX >= innerMinX && rn.gridX <= innerMaxX &&
-                                                        rn.gridY >= innerMinY && rn.gridY <= innerMaxY);
-                                if (!insideFootprint)
+                                bool inside = (rn.gridX >= innerMinX && rn.gridX <= innerMaxX &&
+                                               rn.gridY >= innerMinY && rn.gridY <= innerMaxY);
+                                if (!inside)
                                 {
                                     bool atReservedCenter = false;
                                     try { atReservedCenter = ua.IsAtReservedNodeCenter(0.25f) && ua.holdReservation; } catch { atReservedCenter = false; }
+
+                                    if (!atReservedCenter && ua.reservedNode != null)
+                                    {
+                                        try
+                                        {
+                                            float tol2 = gm.nodeDiameter * 1.0f;
+                                            float dist2 = Vector2.Distance(ua.transform.position, ua.reservedNode.centerPosition);
+                                            if (dist2 <= tol2 && (ua.holdReservation || ua.reservedNode != null))
+                                                atReservedCenter = true;
+                                        }
+                                        catch { }
+                                    }
+
                                     if (atReservedCenter)
                                     {
                                         try { AddBuilder(ua); } catch { }
                                         nearbyAgents.Add(ua);
                                         continue;
                                     }
+
+                                    // permissive fallback: if villager is near building edge (outside footprint) count them
+                                    try
+                                    {
+                                        float edgeTol = gm.nodeDiameter * 1.2f;
+                                        float distToCenter = Vector2.Distance(ua.transform.position, center);
+                                        float halfFootprint = Mathf.Max(Size.x, Size.y) * 0.5f * gm.nodeDiameter;
+                                        if (distToCenter <= halfFootprint + edgeTol && !IsPositionInsideFootprint(ua.transform.position, gm, innerMinX, innerMinY, innerMaxX, innerMaxY))
+                                        {
+                                            try { AddBuilder(ua); } catch { }
+                                            nearbyAgents.Add(ua);
+                                            continue;
+                                        }
+                                    }
+                                    catch { }
                                 }
                             }
                         }
@@ -337,7 +410,7 @@ public class BuildingConstruction : MonoBehaviour
                         if (gm != null)
                         {
                             Vector2Int start = gm.GetStartIndicesForCenteredFootprint(transform.position, Size);
-                            Node centerNode = gm.GetNode(start.x + Size.x/2, start.y + Size.y/2);
+                            Node centerNode = gm.GetNode(start.x + Size.x / 2, start.y + Size.y / 2);
                             if (centerNode != null)
                             {
                                 var pref = nrs.FindAndReserveBestNode(centerNode, agent, Mathf.Max(3, Size.x));
@@ -440,4 +513,16 @@ public class BuildingConstruction : MonoBehaviour
         sprite.color = Color.red;
     }
 
+    // Helper to determine if a world position falls inside the current footprint grid rect
+    private bool IsPositionInsideFootprint(Vector3 worldPos, GridManager gm, int minX, int minY, int maxX, int maxY)
+    {
+        if (gm == null) return false;
+        try
+        {
+            var n = gm.NodeFromWorldPoint(worldPos);
+            if (n == null) return false;
+            return (n.gridX >= minX && n.gridX <= maxX && n.gridY >= minY && n.gridY <= maxY);
+        }
+        catch { return false; }
+    }
 }

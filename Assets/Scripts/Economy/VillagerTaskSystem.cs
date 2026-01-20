@@ -2,8 +2,8 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-
-[RequireComponent(typeof(UnitAgent))]
+[RequireComponent(typeof(UnitAgent))
+]
 public class VillagerTaskSystem : MonoBehaviour
 {
     // global registry used by recruiter/other systems
@@ -34,12 +34,26 @@ public class VillagerTaskSystem : MonoBehaviour
     bool returningToDropOff;
     Vector3 myHarvestSpot;
 
+    // Harvest timing (tick-driven)
+    [Tooltip("Harvest one unit every N ticks (TimeController ticks).")]
+    public int harvestIntervalTicks = 50;
+    private int harvestTickCounter = 0;
+
+    // Tick-based guard to avoid backlog-driven instant harvesting.
+    private long lastHarvestTick = -999;
+
+    // Small startup delay (ticks) after arriving before harvesting to avoid same-tick arrival+harvest.
+    private int initialHarvestDelayTicks = 0;
+
     // BUILD state (kept minimal)
     BuildingConstruction buildingToConstruct;
     // preferred approach node (reserved by recruiter) — must be honored by CommandBuild/HandleBuildUpdate
     Node preferredApproachNode;
 
-    // timers
+    // idle / scheduling converted to ticks
+    private int idleTickCounter = 0;
+    private int idleIntervalTicks = 1;
+    // legacy float fallback used only when TimeController is absent
     float idleTimer = 0f;
 
     void Awake()
@@ -51,11 +65,21 @@ public class VillagerTaskSystem : MonoBehaviour
     {
         // register into global list for systems that query all villagers
         if (!allRegisteredVillagers.Contains(this)) allRegisteredVillagers.Add(this);
+
+        // subscribe to tick for harvest timing and other tick-driven behaviors
+        try { TimeController.OnTick -= OnTick; } catch { }
+        try { TimeController.OnTick += OnTick; } catch { }
     }
 
     void OnDisable()
     {
         if (allRegisteredVillagers.Contains(this)) allRegisteredVillagers.Remove(this);
+        try { TimeController.OnTick -= OnTick; } catch { }
+    }
+
+    void OnDestroy()
+    {
+        try { TimeController.OnTick -= OnTick; } catch { }
     }
 
     public bool IsIdle()
@@ -76,7 +100,22 @@ public class VillagerTaskSystem : MonoBehaviour
             Init(drop);
         }
 
-        idleTimer = Random.Range(0f, idleSearchInterval * 0.5f);
+        // compute tick-based intervals if TimeController exists, otherwise fall back to seconds-based behavior
+        if (TimeController.Instance != null)
+        {
+            idleIntervalTicks = Mathf.Max(1, Mathf.RoundToInt(idleSearchInterval / Mathf.Max(TimeController.Instance.tickInterval, 1e-6f)));
+        }
+        else
+        {
+            // fallback guess (if no TimeController): assume 50 TPS as a reasonable default for converting seconds -> ticks
+            idleIntervalTicks = Mathf.Max(1, Mathf.RoundToInt(idleSearchInterval / 0.02f));
+        }
+
+        // randomize initial idle counter to stagger villagers
+        idleTickCounter = Random.Range(0, Mathf.Max(1, idleIntervalTicks / 2));
+
+        // legacy float fallback: schedule first check in seconds (only used if TimeController absent)
+        idleTimer = Time.time + idleSearchInterval * Random.Range(0.0f, 0.5f);
     }
 
     public void Init(DropOffBuilding defaultDropOff)
@@ -109,20 +148,291 @@ public class VillagerTaskSystem : MonoBehaviour
         }
     }
 
+    // Keep Update light — all behavior is tick-driven for performance.
     void Update()
     {
+        // Legacy fallback: if TimeController not present, keep original idle timing behavior here.
+        if (TimeController.Instance == null)
+        {
+            if (currentTask == VillagerTask.Idle)
+            {
+                if (Time.time >= idleTimer)
+                {
+                    // fallback search uses force to keep behavior consistent when no TimeController exists
+                    VillagerSearchHelper.TryFindWork(this, 0f, force: true);
+                    idleTimer = Time.time + idleSearchInterval;
+                }
+            }
+
+            // We still leave build/gather checks to Update when no TimeController exists.
+            if (currentTask == VillagerTask.Build)
+                HandleBuildUpdate();
+            if (currentTask == VillagerTask.Gather)
+                HandleGatherUpdate();
+        }
+    }
+
+    // Central tick handler — runs all villager logic on TimeController ticks.
+    void OnTick(float dt)
+    {
+        if (TimeController.Instance == null) return; // safety
+
+        // BUILD: run build logic on tick
         if (currentTask == VillagerTask.Build)
         {
-            HandleBuildUpdate();
+            HandleBuildUpdate(); // updated to be safe when called from ticks
+            // no return; allow other logic to be considered below
+        }
+
+        // RETURN RESOURCES: explicit state handling (fixes stalling where units remain stuck in ReturnResources)
+        if (currentTask == VillagerTask.ReturnResources)
+        {
+            // Mirror the returning-to-dropoff behavior previously executed inside the Gather handler.
+            DropOffBuilding drop = dropOff ?? FindCompletedDropoff();
+            if (drop == null)
+            {
+                // no dropoff -> clear gather state and fall back to idle search
+                ClearGatherState();
+                return;
+            }
+
+            var gm = GridManager.Instance;
+            Node dropNode = null;
+            if (drop != null)
+            {
+                // prefer tick-consistent sim position
+                Vector3 searchPos = agent != null ? agent.SimPosition : transform.position;
+                dropNode = drop.GetNearestDropoffNode(searchPos);
+            }
+
+            if (dropNode == null && gm != null)
+            {
+                Node center = gm.NodeFromWorldPoint(drop.transform.position);
+                if (center != null)
+                    dropNode = gm.FindClosestWalkableNode(center.gridX, center.gridY);
+            }
+
+            if (dropNode != null)
+            {
+                var nrs = NodeReservationSystem.Instance;
+                if (nrs != null)
+                {
+                    try
+                    {
+                        Node reserved = VillagerReservationHelper.TryReserveOrFindAlt(agent, dropNode, 2);
+                        if (reserved != null) dropNode = reserved;
+                    }
+                    catch { }
+                }
+
+                // Always set destination to drop node to ensure villager heads there
+                try { agent.SetDestinationToNode(dropNode); } catch { }
+
+                // Use multiple arrival checks: reserved-node center, or distance-based tolerance.
+                float tol = (GridManager.Instance != null) ? GridManager.Instance.nodeDiameter * 0.8f : 0.9f;
+                bool arrived = false;
+
+                try
+                {
+                    // If the agent holds this reservation, prefer reserved-center check
+                    if (agent != null && (agent.reservedNode == dropNode || agent.holdReservation))
+                    {
+                        arrived = agent.IsAtReservedNodeCenter(0.25f);
+                    }
+
+                    // Fallback: distance check using SimPosition for tick-accurate checks
+                    if (!arrived)
+                    {
+                        Vector3 sim = agent != null ? agent.SimPosition : transform.position;
+                        float d = Vector2.Distance(new Vector2(sim.x, sim.y), dropNode.centerPosition);
+                        if (d <= tol) arrived = true;
+                    }
+                }
+                catch
+                {
+                    // conservative fallback
+                    Vector3 sim2 = agent != null ? agent.SimPosition : transform.position;
+                    float d2 = Vector2.Distance(new Vector2(sim2.x, sim2.y), dropNode.centerPosition);
+                    if (d2 <= tol) arrived = true;
+                }
+
+                if (arrived)
+                {
+                    DepositCarried(drop);
+                }
+
+                return;
+            }
+
+            // If no node found, clear to avoid permanent stuck
+            ClearGatherState();
             return;
         }
 
+        // GATHER: handle harvesting on ticks (including the transition that sets returningToDropOff)
         if (currentTask == VillagerTask.Gather)
         {
-            HandleGatherUpdate();
-            return;
-        }
+            // If we're supposed to be gathering but have no target (node got removed),
+            // fall back to searching for work again so this villager keeps working.
+            if (targetNode == null && !returningToDropOff)
+            {
+                // reset state to idle so TryFindWork can assign new target
+                currentTask = VillagerTask.Idle;
+                // force immediate search to ensure all idle villagers attempt to get work
+                VillagerSearchHelper.TryFindWork(this, 0f, force: true);
+                return;
+            }
 
+            // If we're returning, the return path is handled by the explicit ReturnResources state above.
+            // However, preserve existing behavior when return is initiated inside this tick.
+            if (returningToDropOff)
+            {
+                // Transition to explicit return state so subsequent ticks continue return handling.
+                currentTask = VillagerTask.ReturnResources;
+
+                // Execute same first-step logic (attempt a reservation and set destination) now; completion handled by ReturnResources block next tick.
+                var drop = dropOff ?? FindCompletedDropoff();
+                if (drop == null)
+                {
+                    ClearGatherState();
+                    return;
+                }
+
+                var gm = GridManager.Instance;
+                Node dropNode = null;
+                if (drop != null)
+                    dropNode = drop.GetNearestDropoffNode(agent != null ? agent.SimPosition : transform.position);
+
+                if (dropNode == null && gm != null)
+                {
+                    Node center = gm.NodeFromWorldPoint(drop.transform.position);
+                    if (center != null)
+                        dropNode = gm.FindClosestWalkableNode(center.gridX, center.gridY);
+                }
+
+                if (dropNode != null)
+                {
+                    var nrs = NodeReservationSystem.Instance;
+                    if (nrs != null)
+                    {
+                        try
+                        {
+                            Node reserved = VillagerReservationHelper.TryReserveOrFindAlt(agent, dropNode, 2);
+                            if (reserved != null) dropNode = reserved;
+                        }
+                        catch { }
+                    }
+
+                    // Always set destination to drop node to ensure villager heads there
+                    agent.SetDestinationToNode(dropNode);
+
+                    // Check arrival immediately (same logic as before)
+                    float tol = (GridManager.Instance != null) ? GridManager.Instance.nodeDiameter * 0.8f : 0.9f;
+                    bool arrived = false;
+
+                    try
+                    {
+                        if (agent.reservedNode == dropNode || agent.holdReservation)
+                        {
+                            arrived = agent.IsAtReservedNodeCenter(0.25f);
+                        }
+
+                        if (!arrived)
+                        {
+                            Vector3 sim = agent.SimPosition;
+                            float d = Vector2.Distance(new Vector2(sim.x, sim.y), dropNode.centerPosition);
+                            if (d <= tol) arrived = true;
+                        }
+                    }
+                    catch
+                    {
+                        Vector3 sim2 = agent.SimPosition;
+                        float d2 = Vector2.Distance(new Vector2(sim2.x, sim2.y), dropNode.centerPosition);
+                        if (d2 <= tol) arrived = true;
+                    }
+
+                    if (arrived)
+                    {
+                        DepositCarried(drop);
+                    }
+
+                    return;
+                }
+
+                ClearGatherState();
+                return;
+            }
+
+            // harvesting: check arrival to harvest spot (use SimPosition for tick-driven accuracy)
+            Vector3 simPosHarvest = agent != null ? agent.SimPosition : transform.position;
+            bool atSpot = (simPosHarvest - myHarvestSpot).sqrMagnitude <= 0.5f * 0.5f;
+            if (!atSpot)
+            {
+                // reset counter when not at spot to avoid fast catch-ups
+                harvestTickCounter = 0;
+                return;
+            }
+
+            // If we just arrived to begin gathering, require the initial settle ticks before harvesting.
+            if (initialHarvestDelayTicks > 0)
+            {
+                if (verboseDebug) Debug.Log($"[Villager] {name} settling for {initialHarvestDelayTicks} tick(s) before harvesting.");
+                initialHarvestDelayTicks--;
+                harvestTickCounter = 0; // ensure counter doesn't accumulate during settle
+                return;
+            }
+
+            // Use tick-index guard to ensure one harvest per configured tick interval.
+            long currentTick = TimeController.GlobalTickIndex;
+            long ticksSinceLast = currentTick - lastHarvestTick;
+            if (lastHarvestTick >= 0 && ticksSinceLast < Mathf.Max(1, harvestIntervalTicks))
+            {
+                // still waiting for required tick interval
+                return;
+            }
+
+            // perform a single harvest now and mark lastHarvestTick
+            lastHarvestTick = currentTick;
+
+            // Attempt to harvest one unit
+            int harvested = 0;
+            try
+            {
+                if (targetNode != null) harvested = targetNode.Harvest(1);
+            }
+            catch
+            {
+                harvested = 0;
+                targetNode = null;
+            }
+
+            if (harvested <= 0)
+            {
+                // node depleted or invalid -> clear and try find new work next tick
+                targetNode = null;
+                ClearGatherState();
+                VillagerSearchHelper.TryFindWork(this, 0f, force: true);
+                return;
+            }
+
+            // Add to carried resources
+            ResourceType rtype = targetNode != null ? targetNode.resourceType : default;
+            if (carriedResources.ContainsKey(rtype)) carriedResources[rtype] += harvested;
+            else carriedResources[rtype] = harvested;
+            carriedTotal += harvested;
+
+            if (verboseDebug) Debug.Log($"[Villager] {name} harvested {harvested} of {rtype} (carried {carriedTotal}/{carryCapacity}).");
+
+            // If filled -> return to dropoff
+            if (carriedTotal >= carryCapacity)
+            {
+                returningToDropOff = true;
+            }
+
+            return;
+        } // end gather
+
+        // Idle tick handling
         if (currentTask == VillagerTask.Idle)
         {
             // If recruiter previously assigned this villager to a construction, begin build now.
@@ -137,15 +447,18 @@ public class VillagerTaskSystem : MonoBehaviour
                 return;
             }
 
-            if (Time.time >= idleTimer)
+            // count ticks and run idle search when interval reached
+            idleTickCounter++;
+            if (idleTickCounter >= idleIntervalTicks)
             {
-                TryFindWork();
-                idleTimer = Time.time + idleSearchInterval;
+                idleTickCounter = 0;
+                // force all idle villagers to attempt work (fix: many were never trying due to stagger slot)
+                VillagerSearchHelper.TryFindWork(this, 0f, force: true);
             }
         }
     }
 
-    // --- Build (minimal) ---
+    // --- Build (kept mostly as before but safe to call from ticks) ---
     void HandleBuildUpdate()
     {
         if (buildingToConstruct == null || buildingToConstruct.isFinished)
@@ -287,7 +600,8 @@ public class VillagerTaskSystem : MonoBehaviour
                     // skip excluded nodes (already assigned/reserved by other builders)
                     if (exclude != null && exclude.Contains(n)) continue;
 
-                    float dsq = (new Vector2(n.centerPosition.x - ua.transform.position.x, n.centerPosition.y - ua.transform.position.y)).sqrMagnitude;
+                    Vector3 uaPos = ua != null ? ua.SimPosition : ua.transform.position;
+                    float dsq = (new Vector2(n.centerPosition.x - uaPos.x, n.centerPosition.y - uaPos.y)).sqrMagnitude;
                     if (dsq < bestSqr) { bestSqr = dsq; best = n; }
                 }
             }
@@ -378,11 +692,12 @@ public class VillagerTaskSystem : MonoBehaviour
 
                         if (candidates.Count == 0) continue;
 
-                        // sort by distance to agent
+                        // sort by distance to agent (use SimPosition for tick-aware behavior)
+                        Vector3 aPos = agent != null ? agent.SimPosition : agent.transform.position;
                         candidates.Sort((a, b) =>
                         {
-                            float da = (new Vector2(a.centerPosition.x - agent.transform.position.x, a.centerPosition.y - agent.transform.position.y)).sqrMagnitude;
-                            float db = (new Vector2(b.centerPosition.x - agent.transform.position.x, b.centerPosition.y - agent.transform.position.y)).sqrMagnitude;
+                            float da = (new Vector2(a.centerPosition.x - aPos.x, a.centerPosition.y - aPos.y)).sqrMagnitude;
+                            float db = (new Vector2(b.centerPosition.x - aPos.x, b.centerPosition.y - aPos.y)).sqrMagnitude;
                             return da.CompareTo(db);
                         });
 
@@ -438,124 +753,50 @@ public class VillagerTaskSystem : MonoBehaviour
         }
     }
 
-    // --- Gather (simplified) ---
+    // --- Gather (kept minimal) ---
     void HandleGatherUpdate()
     {
+        // This method remains callable from ticks or Update fallback, but contains only arrival/movement logic.
         if (returningToDropOff)
         {
-            currentTask = VillagerTask.ReturnResources;
-
-            DropOffBuilding drop = dropOff ?? FindCompletedDropoff();
-            if (drop == null)
-            {
-                ClearGatherState();
-                return;
-            }
-
-            var gm = GridManager.Instance;
-            Node dropNode = null;
-            if (drop != null)
-                dropNode = drop.GetNearestDropoffNode(transform.position);
-
-            if (dropNode == null && gm != null)
-            {
-                Node center = gm.NodeFromWorldPoint(drop.transform.position);
-                if (center != null)
-                    dropNode = gm.FindClosestWalkableNode(center.gridX, center.gridY);
-            }
-
-            if (dropNode != null)
-            {
-                // ask agent to go to drop node
-                if (!agent.HasPath())
-                    agent.SetDestinationToNode(dropNode);
-
-                // arrival check using node diameter if available
-                float tol = (GridManager.Instance != null) ? GridManager.Instance.nodeDiameter * 0.6f : 0.9f;
-                if ((agent.transform.position - dropNode.centerPosition).sqrMagnitude <= (tol * tol))
-                {
-                    DepositCarried(drop);
-                }
-
-                return;
-            }
-
-            // If no node found, clear to avoid permanent stuck
-            ClearGatherState();
+            // Return logic handled fully in OnTick when TimeController present.
             return;
         }
 
-        // harvesting: check arrival to harvest spot
-        bool atSpot = (agent.transform.position - myHarvestSpot).sqrMagnitude <= 0.5f * 0.5f;
+        // harvesting: check arrival to harvest spot (if called from Update fallback we still rely on transform)
+        Vector3 pos = (TimeController.Instance != null && agent != null) ? agent.SimPosition : transform.position;
+        bool atSpot = (pos - myHarvestSpot).sqrMagnitude <= 0.5f * 0.5f;
         if (!atSpot) return;
 
-        // instantaneous harvest (no timers)
-        if (targetNode == null)
+        // harvesting is driven by TimeController ticks in OnTick, so do not perform instantaneous harvest here.
+    }
+
+    // Helper that finds a reasonable dropoff node for a building (best-effort).
+    Node GetBestDropoffNode(DropOffBuilding drop)
+    {
+        if (drop == null) return null;
+        var gm = GridManager.Instance;
+        if (gm == null) return null;
+
+        Node n = drop.GetNearestDropoffNode(transform.position);
+        if (n != null) return n;
+
+        Node center = gm.NodeFromWorldPoint(drop.transform.position);
+        if (center != null)
         {
-            ClearGatherState();
-            TryFindWork();
-            return;
+            // prefer perimeter nodes, otherwise closest walkable
+            Node p = gm.FindClosestWalkableNode(center.gridX, center.gridY);
+            if (p != null) return p;
         }
 
-        int space = carryCapacity - carriedTotal;
-        if (space <= 0)
-        {
-            // already full -> return
-            returningToDropOff = true;
-            return;
-        }
-
-        int harvested = 0;
-        try
-        {
-            harvested = targetNode.Harvest(space);
-        }
-        catch
-        {
-            harvested = 0;
-            targetNode = null;
-        }
-
-        if (harvested > 0)
-        {
-            ResourceType rtype = targetNode != null ? targetNode.resourceType : default;
-            if (carriedResources.ContainsKey(rtype)) carriedResources[rtype] += harvested;
-            else carriedResources[rtype] = harvested;
-            carriedTotal += harvested;
-        }
-
-        // If filled or node depleted -> return
-        if (carriedTotal >= carryCapacity || targetNode == null)
-        {
-            returningToDropOff = true;
-
-            // compute dropoff and send immediately
-            var drop = FindCompletedDropoff();
-            if (drop != null)
-            {
-                Node target = drop.GetNearestDropoffNode(transform.position);
-                if (target == null && GridManager.Instance != null)
-                {
-                    Node center = GridManager.Instance.NodeFromWorldPoint(drop.transform.position);
-                    if (center != null)
-                        target = GridManager.Instance.FindClosestWalkableNode(center.gridX, center.gridY);
-                }
-
-                if (target != null)
-                    agent.SetDestinationToNode(target);
-                else
-                    ClearGatherState();
-            }
-            else
-            {
-                ClearGatherState();
-            }
-        }
+        return null;
     }
 
     public void CommandGather(ResourceNode node, Vector3 harvestSpot, bool playerCommand = false)
     {
-        ClearGatherState();
+        // Strong reset: drop current tasks and carried resources so player-issued commands take immediate precedence.
+        ClearAllTasks(); // clears build/gather state and carried resources
+
         if (node == null) return;
 
         // If this is NOT a player-issued command and owner has no dropoff -> treat as move / skip gather
@@ -571,15 +812,25 @@ public class VillagerTaskSystem : MonoBehaviour
 
         if (agent != null)
         {
+            // Ensure agent is active and clear any local/global reservations so the new player command is authoritative.
             agent.SetIdle(false);
 
-            // Ensure previous reservation is fully released so we don't snap back to spawn.
             try { agent.ClearCombatReservation(); } catch { }
+            try { NodeReservationSystem.Instance?.ReleaseReservation(agent); } catch { }
             try { agent.reservedNode = null; agent.holdReservation = false; } catch { }
+
+            // Cancel any existing path so we don't later snap back to it.
+            try { agent.Stop(); } catch { }
         }
 
+        // Set gather state for the new command
         currentTask = VillagerTask.Gather;
         targetNode = node;
+        harvestTickCounter = 0;
+        returningToDropOff = false;
+
+        // prevent immediate harvesting in the same tick we arrive — give first harvest interval as guard
+        initialHarvestDelayTicks = 1;
 
         var gm = GridManager.Instance;
         Node desired = gm != null ? gm.NodeFromWorldPoint(harvestSpot) : null;
@@ -655,13 +906,24 @@ public class VillagerTaskSystem : MonoBehaviour
             }
         }
 
+        // Release any dropoff reservation so other villagers may use it
+        try { NodeReservationSystem.Instance?.ReleaseReservation(agent); } catch { }
+        try { agent.reservedNode = null; agent.holdReservation = false; } catch { }
+
+        // Clear carried resources and return state
         carriedResources.Clear();
         carriedTotal = 0;
         returningToDropOff = false;
         targetNode = null;
 
-        // immediately search for more work
-        TryFindWork();
+        // Ensure villager returns to Idle state so OnTick idle logic / TryFindWork can run reliably.
+        // Reset harvest/idle counters so they can be scheduled immediately.
+        currentTask = VillagerTask.Idle;
+        harvestTickCounter = 0;
+        idleTickCounter = 0;
+
+        // Force immediate search bypassing stagger so unit resumes work promptly.
+        VillagerSearchHelper.TryFindWork(this, 0f, force: true);
     }
 
     void ClearGatherState()
@@ -671,6 +933,7 @@ public class VillagerTaskSystem : MonoBehaviour
         carriedTotal = 0;
         returningToDropOff = false;
         myHarvestSpot = Vector3.zero;
+        harvestTickCounter = 0;
         currentTask = VillagerTask.Idle;
     }
 
@@ -696,6 +959,10 @@ public class VillagerTaskSystem : MonoBehaviour
     {
         if (currentTask != VillagerTask.Move) return;
         currentTask = VillagerTask.Idle;
+
+        // reset tick counters for immediate idle scheduling
+        idleTickCounter = 0;
+        // legacy fallback
         idleTimer = 0f;
     }
 
@@ -704,6 +971,9 @@ public class VillagerTaskSystem : MonoBehaviour
     {
         ClearAllTasks();
         currentTask = VillagerTask.Idle;
+
+        // reset tick counters for immediate idle scheduling
+        idleTickCounter = 0;
         idleTimer = 0f;
         if (agent != null) try { agent.SetIdle(true); } catch { }
     }

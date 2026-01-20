@@ -5,6 +5,10 @@ using UnityEngine;
 [RequireComponent(typeof(Rigidbody2D))]
 public class UnitAgent : MonoBehaviour
 {
+    // Registry for all UnitAgent instances (cheap iteration without FindObjectsOfType)
+    private static readonly List<UnitAgent> allAgents = new List<UnitAgent>();
+    public static IReadOnlyList<UnitAgent> AllAgents => allAgents;
+
     [Header("Movement")]
     public float moveSpeed = 3.5f;
     public float acceleration = 10f;
@@ -82,6 +86,15 @@ public class UnitAgent : MonoBehaviour
         col = GetComponent<Collider2D>();
         lastPosition = transform.position;
 
+        // Make unit colliders triggers so units do not physically push each other.
+        // Movement is node/sim driven; physics-based collision responses cause the lag/teleporting behavior.
+        try
+        {
+            if (col != null)
+                col.isTrigger = true;
+        }
+        catch { }
+
         if (rb != null)
         {
             rb.simulated = true;
@@ -109,6 +122,9 @@ public class UnitAgent : MonoBehaviour
 
     private void OnEnable()
     {
+        // register into global agent list
+        if (!allAgents.Contains(this)) allAgents.Add(this);
+
         // keep sim positions synced when enabled
         simPrevPosition = transform.position;
         simPosition = transform.position;
@@ -120,6 +136,9 @@ public class UnitAgent : MonoBehaviour
 
     private void OnDisable()
     {
+        // unregister
+        try { allAgents.Remove(this); } catch { }
+
         // unsubscribe to avoid dangling handlers
         try { TimeController.OnTick -= OnTick; } catch { }
     }
@@ -129,6 +148,7 @@ public class UnitAgent : MonoBehaviour
         // final cleanup: ensure unsubscribed and reservation released
         try { TimeController.OnTick -= OnTick; } catch { }
         try { NodeReservationSystem.Instance?.ReleaseReservation(this); } catch { }
+        try { allAgents.Remove(this); } catch { }
     }
 
     private void Start()
@@ -143,6 +163,7 @@ public class UnitAgent : MonoBehaviour
             {
                 if (!nrs.IsReserved(current))
                 {
+
                     nrs.ReserveNode(current, this);
                     reservedNode = current;
                     holdReservation = true;
@@ -244,30 +265,76 @@ public class UnitAgent : MonoBehaviour
 
     void OnArrivedAtReservedNode()
     {
-        // Prevent re-entrant calls which can happen when other components (e.g. UnitCombat)
-        // call back into UnitAgent and trigger another smooth snap → stack overflow.
+        // Prevent re-entrant arrival handling
         if (_handlingArrival) return;
         _handlingArrival = true;
 
         try
         {
-            var uc = GetComponent<UnitCombat>();
-            if (uc != null)
+            // Notify combat and villager systems (best-effort, non-throwing)
+            try
             {
-                try { uc.OnArrivedAtReservedNode(); } catch { }
+                var uc = GetComponent<UnitCombat>();
+                if (uc != null) uc.OnArrivedAtReservedNode();
             }
+            catch { }
 
-            var vt = GetComponent<VillagerTaskSystem>();
-            if (vt != null)
+            try
             {
-                try { vt.OnMoveCompleted(); } catch { }
+                var vt = GetComponent<VillagerTaskSystem>();
+                if (vt != null) vt.OnMoveCompleted();
             }
+            catch { }
 
-            // Only release reservation if we're not holding it (original behavior).
-            if (!holdReservation && NodeReservationSystem.Instance != null && formationId == 0)
+            // Ensure reservation semantics for idle units:
+            // - If NodeReservationSystem is present and this unit is not part of a formation,
+            //   try to ensure the node the unit stands on is reserved for the unit while idle.
+            // - Only release reservations when the unit is not holding it and the unit is active (not idle).
+            try
             {
-                try { NodeReservationSystem.Instance.ReleaseReservation(this); } catch { }
+                var nrs = NodeReservationSystem.Instance;
+                var gm = GridManager.Instance;
+
+                if (nrs != null && formationId == 0)
+                {
+                    // If we don't yet have a reservedNode (arrived via a non-reserving move),
+                    // and the unit is idle, attempt to claim the node under our feet so other units
+                    // cannot be commanded onto it.
+                    if (reservedNode == null)
+                    {
+                        bool isIdle = DebugIsIdle;
+                        if (isIdle && gm != null)
+                        {
+                            Node nodeHere = null;
+                            try { nodeHere = gm.NodeFromWorldPoint(transform.position); } catch { nodeHere = null; }
+
+                            if (nodeHere != null && nodeHere.walkable)
+                            {
+                                bool got = false;
+                                try { got = nrs.ReserveNode(nodeHere, this); } catch { got = false; }
+                                if (got)
+                                {
+                                    try { reservedNode = nodeHere; } catch { }
+                                    try { holdReservation = true; } catch { }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // If we have a reserved node already, only release it automatically when:
+                        // - we are not intentionally holding it, AND
+                        // - the unit is active (not idle) so we won't leave it unprotected while moving.
+                        bool isIdle = DebugIsIdle;
+                        if (!holdReservation && !isIdle)
+                        {
+                            try { nrs.ReleaseReservation(this); } catch { }
+                            try { reservedNode = null; } catch { }
+                        }
+                    }
+                }
             }
+            catch { /* best-effort only */ }
         }
         finally
         {
@@ -637,27 +704,27 @@ public class UnitAgent : MonoBehaviour
         if (distToGoal < 0.6f) return Vector2.zero;
 
         // Use simPosition for overlap query to avoid mismatch between tick sim and frame transform
-        Collider2D[] hits = Physics2D.OverlapCircleAll(sim2, repulsionRadius);
         Vector2 rep = Vector2.zero;
 
-        foreach (var hit in hits)
+        // Use the global agent registry instead of Physics2D.OverlapCircleAll for performance and to avoid physics interactions.
+        var agents = AllAgents;
+        if (agents != null)
         {
-            if (hit == null) continue;
-            var otherRb = hit.attachedRigidbody;
-            if (otherRb == rb) continue;
-
-            UnitAgent other = hit.GetComponent<UnitAgent>();
-            if (other == null) continue;
-
-            // Prefer using other.SimPosition so repulsion is calculated in simulation space
-            Vector2 otherPos = new Vector2(other.SimPosition.x, other.SimPosition.y);
-            Vector2 away = sim2 - otherPos;
-            float d = away.magnitude;
-
-            if (d > 0.001f && d < repulsionRadius)
+            for (int i = 0; i < agents.Count; i++)
             {
-                float force = repulsionStrength * (1f - d / repulsionRadius);
-                rep += away.normalized * force;
+                var other = agents[i];
+                if (other == null) continue;
+                if (other == this) continue;
+
+                Vector2 otherPos = new Vector2(other.SimPosition.x, other.SimPosition.y);
+                Vector2 away = sim2 - otherPos;
+                float d = away.magnitude;
+
+                if (d > 0.001f && d < repulsionRadius)
+                {
+                    float force = repulsionStrength * (1f - d / repulsionRadius);
+                    rep += away.normalized * force;
+                }
             }
         }
 

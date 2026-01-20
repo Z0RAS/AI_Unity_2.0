@@ -490,13 +490,19 @@ public class RTSCommandController : MonoBehaviour
     private bool IsNodePhysicallyOccupiedByOther(Node node, List<UnitAgent> ignoreList)
     {
         if (node == null) return false;
-        float physRadius = Mathf.Max(GridManager.Instance != null ? GridManager.Instance.nodeDiameter * 0.35f : 0.3f, 0.15f);
+
+        var gm = GridManager.Instance;
+        // Increase conservative overlap radius so occupied nodes are detected reliably.
+        float physRadius = Mathf.Max(gm != null ? gm.nodeDiameter * 0.5f : 0.25f, 0.25f);
+
+        // 1) Quick physics overlap check (existing behavior)
         Collider2D[] hits = Physics2D.OverlapCircleAll(node.centerPosition, physRadius);
         foreach (var h in hits)
         {
             if (h == null) continue;
             var ua = h.GetComponent<UnitAgent>();
             if (ua == null) continue;
+
             // ignore units that are part of the issuing selection
             bool isIgnored = false;
             if (ignoreList != null)
@@ -508,6 +514,53 @@ public class RTSCommandController : MonoBehaviour
             }
             if (!isIgnored) return true;
         }
+
+        // 2) Conservative check: consider units reserved/assigned to this node or whose logical center maps to this node.
+        // This prevents race conditions where a unit's collider isn't physically overlapping the node center yet.
+        UnitAgent[] all = Object.FindObjectsOfType<UnitAgent>();
+        foreach (var ua in all)
+        {
+            if (ua == null) continue;
+
+            bool isIgnored = false;
+            if (ignoreList != null)
+            {
+                for (int i = 0; i < ignoreList.Count; i++)
+                {
+                    if (ignoreList[i] == ua) { isIgnored = true; break; }
+                }
+            }
+            if (isIgnored) continue;
+
+            // reservedNode or lastAssignedNode claiming this node -> occupied
+            try
+            {
+                if (ua.reservedNode != null && ua.reservedNode == node) return true;
+                if (ua.lastAssignedNode != null && ua.lastAssignedNode == node) return true;
+            }
+            catch { }
+
+            // transform center mapped to this node
+            try
+            {
+                if (gm != null)
+                {
+                    var unitNode = gm.NodeFromWorldPoint(ua.transform.position);
+                    if (unitNode != null)
+                    {
+                        // Compare by grid coords to avoid reference equality issues
+                        if (unitNode.gridX == node.gridX && unitNode.gridY == node.gridY) return true;
+                    }
+
+                    // also check sim position (tick-driven sim) for more robust detection
+                    Vector3 sim = ua.SimPosition;
+                    float d2 = (new Vector2(sim.x - node.centerPosition.x, sim.y - node.centerPosition.y)).sqrMagnitude;
+                    if (d2 <= physRadius * physRadius) return true;
+                }
+            }
+            catch { }
+        }
+
         return false;
     }
 

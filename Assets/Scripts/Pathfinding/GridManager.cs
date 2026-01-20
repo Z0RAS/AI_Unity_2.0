@@ -297,7 +297,6 @@ public class GridManager : MonoBehaviour
     {
         if (x < 0 || x >= gridSizeX || y < 0 || y >= gridSizeY)
         {
-            Debug.Log($"[GridManager] Node ({x}, {y}) is out of bounds.");
             return null;
         }
 

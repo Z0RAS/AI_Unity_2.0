@@ -12,6 +12,10 @@ public class TimeController : MonoBehaviour
     public float LastTickDelta { get; private set; }
     public float InterpolationAlpha { get; private set; }
 
+    // Global tick index (monotonic). Use this to make tick-driven systems deterministic
+    // and to avoid realtime/backlog races.
+    public static long GlobalTickIndex { get; private set; } = 0;
+
     public static event Action<float> OnTick;
 
     float accumulator = 0f;
@@ -29,6 +33,10 @@ public class TimeController : MonoBehaviour
         while (accumulator >= tickInterval)
         {
             LastTickDelta = tickInterval;
+
+            // Advance global tick index before invoking subscribers
+            GlobalTickIndex++;
+
             try { OnTick?.Invoke(LastTickDelta); } catch { }
             accumulator -= tickInterval;
         }
